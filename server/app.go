@@ -68,6 +68,8 @@ type App struct {
 	botAudit    map[string]int
 }
 
+const maxRateBuckets = 4096
+
 type AuthUser struct {
 	ID          string              `json:"id"`
 	Username    string              `json:"username"`
@@ -744,46 +746,34 @@ func (a *App) hasUsers() (bool, error) {
 }
 
 func (a *App) setSessionCookie(w http.ResponseWriter, r *http.Request, token string, expires time.Time) {
-	secure := false
-	if r != nil {
-		secure = r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
-	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   secure,
+		Secure:   requestIsSecure(r),
 		Expires:  expires,
 	})
 }
 
-func (a *App) clearSessionCookie(w http.ResponseWriter) {
+func (a *App) clearSessionCookieForRequest(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
+		Secure:   requestIsSecure(r),
 		MaxAge:   -1,
 	})
 }
 
-func (a *App) clearSessionCookieForRequest(w http.ResponseWriter, r *http.Request) {
-	secure := false
-	if r != nil {
-		secure = r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+func requestIsSecure(r *http.Request) bool {
+	if r == nil {
+		return false
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    "",
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-		Secure:   secure,
-		MaxAge:   -1,
-	})
+	return r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
 }
 
 func (a *App) createSession(userID string) (string, time.Time, error) {
@@ -994,7 +984,7 @@ func clientIP(r *http.Request) string {
 }
 
 func normalizeEventType(payload eventPayload, pixelID string) string {
-	if payload.Revenue != nil && payload.Revenue.Amount > 0 {
+	if payload.Revenue != nil {
 		return "revenue"
 	}
 	if payload.Name != "" {
@@ -1261,15 +1251,17 @@ func (a *App) createBackup() (string, error) {
 	if strings.ContainsAny(cleanTargetPath, "'\x00\r\n") {
 		return "", fmt.Errorf("invalid backup target path")
 	}
-	escaped := strings.ReplaceAll(targetPath, "'", "''")
-
 	if _, err := a.db.Exec(`pragma wal_checkpoint(full);`); err != nil {
 		return "", err
 	}
-	if _, err := a.db.Exec(`vacuum into '` + escaped + `'`); err != nil {
+	if _, err := a.db.Exec(`vacuum into ` + sqliteStringLiteral(targetPath)); err != nil {
 		return "", err
 	}
 	return targetPath, nil
+}
+
+func sqliteStringLiteral(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func normalizeEventCreatedAt(timestamp int64, now time.Time) time.Time {
@@ -1394,8 +1386,23 @@ func (a *App) allowRateLimit(key string, limit, cost int, window time.Duration) 
 			delete(a.rateBuckets, itemKey)
 		}
 	}
-
 	bucket, ok := a.rateBuckets[key]
+	if !ok && len(a.rateBuckets) >= maxRateBuckets {
+		for len(a.rateBuckets) >= maxRateBuckets {
+			oldestKey := ""
+			var oldestReset time.Time
+			for itemKey, candidate := range a.rateBuckets {
+				if oldestKey == "" || candidate.ResetAt.Before(oldestReset) {
+					oldestKey = itemKey
+					oldestReset = candidate.ResetAt
+				}
+			}
+			if oldestKey == "" {
+				break
+			}
+			delete(a.rateBuckets, oldestKey)
+		}
+	}
 	if !ok || now.After(bucket.ResetAt) {
 		bucket = rateBucket{ResetAt: now.Add(window)}
 	}

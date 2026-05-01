@@ -69,6 +69,7 @@
   collect("pageview", basePayload());
 
   window.addEventListener("hashchange", trackPageviewIfChanged);
+  window.addEventListener("popstate", trackPageviewIfChanged);
 
   var originalPushState = window.history && window.history.pushState;
   if (originalPushState) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,13 @@ func TestNormalizeEventType(t *testing.T) {
 		got := normalizeEventType(eventPayload{Revenue: &RevenueInput{Amount: 10}}, "")
 		if got != "revenue" {
 			t.Fatalf("expected revenue, got %s", got)
+		}
+	})
+
+	t.Run("zero amount revenue", func(t *testing.T) {
+		got := normalizeEventType(eventPayload{Revenue: &RevenueInput{Amount: 0, Currency: "USD"}}, "")
+		if got != "revenue" {
+			t.Fatalf("expected zero-amount revenue to stay revenue, got %s", got)
 		}
 	})
 
@@ -65,6 +73,26 @@ func TestAllowRateLimit(t *testing.T) {
 	}
 	if app.allowRateLimit(key, 2, 1, time.Minute) {
 		t.Fatal("third request should be blocked")
+	}
+}
+
+func TestAllowRateLimitPrunesBucketMap(t *testing.T) {
+	app := &App{
+		rateBuckets: make(map[string]rateBucket, maxRateBuckets+8),
+	}
+	now := nowUTC()
+	for i := 0; i < maxRateBuckets+8; i++ {
+		app.rateBuckets[fmt.Sprintf("key-%d", i)] = rateBucket{
+			Count:   1,
+			ResetAt: now.Add(time.Duration(i+1) * time.Minute),
+		}
+	}
+
+	if !app.allowRateLimit("fresh-key", 2, 1, time.Minute) {
+		t.Fatal("expected new key to be admitted after pruning")
+	}
+	if len(app.rateBuckets) > maxRateBuckets {
+		t.Fatalf("expected rate buckets to be capped at %d, got %d", maxRateBuckets, len(app.rateBuckets))
 	}
 }
 
@@ -157,6 +185,12 @@ func TestHandleSendAcceptsUnknownCollectionFields(t *testing.T) {
 	app.handleSend(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestTrackerScriptListensToPopstate(t *testing.T) {
+	if !strings.Contains(trackerScript, "popstate") {
+		t.Fatal("expected tracker script to listen for popstate")
 	}
 }
 
@@ -323,6 +357,159 @@ func TestRecordEventUpdatesSessionsAndAggregates(t *testing.T) {
 	}
 	if revenueSource != "google" || currency != "USD" || revenueEvents != 1 || revenueAmount != 99.9 {
 		t.Fatalf("unexpected revenue aggregate: source=%q currency=%q events=%d revenue=%v", revenueSource, currency, revenueEvents, revenueAmount)
+	}
+}
+
+func TestRevenueEventKeepsOriginalReferrerAttribution(t *testing.T) {
+	app := newTestApp(t)
+	websiteID := seedWebsite(t, app, "Demo", "demo.local")
+
+	requestFor := func() *http.Request {
+		req := httptest.NewRequest("POST", "/api/send", nil)
+		req.RemoteAddr = "203.0.113.20:4321"
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+		return req
+	}
+
+	if _, err := app.recordEvent(requestFor(), eventRequest{
+		Type: "pageview",
+		Payload: eventPayload{
+			Website:  websiteID,
+			URL:      "https://demo.local/pricing?utm_source=google&utm_medium=cpc&utm_campaign=spring",
+			Referrer: "https://google.com/search?q=sitlys",
+			ID:       "visitor-1",
+		},
+	}); err != nil {
+		t.Fatalf("record pageview: %v", err)
+	}
+	if _, err := app.recordEvent(requestFor(), eventRequest{
+		Type: "revenue",
+		Payload: eventPayload{
+			Website: websiteID,
+			URL:     "https://demo.local/checkout?utm_source=google&utm_medium=cpc&utm_campaign=spring",
+			ID:      "visitor-1",
+			Revenue: &RevenueInput{Amount: 49.5, Currency: "USD"},
+		},
+	}); err != nil {
+		t.Fatalf("record revenue event: %v", err)
+	}
+
+	waitFor(t, 3*time.Second, func() bool {
+		var count int
+		if err := app.db.QueryRow(`select count(*) from events where website_id = ?`, websiteID).Scan(&count); err != nil {
+			return false
+		}
+		return count == 2
+	})
+
+	var referrer string
+	var sessions int
+	var revenue float64
+	if err := app.db.QueryRow(`
+		select referrer_domain, sessions, revenue
+		from agg_referrers_daily
+		where website_id = ?
+	`, websiteID).Scan(&referrer, &sessions, &revenue); err != nil {
+		t.Fatalf("query referrer aggregate: %v", err)
+	}
+	if referrer != "google.com" || sessions != 1 || revenue != 49.5 {
+		t.Fatalf("unexpected referrer aggregate: referrer=%q sessions=%d revenue=%v", referrer, sessions, revenue)
+	}
+}
+
+func TestHandleOverviewReturnsTotalEvents(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.routes()
+	websiteID := seedWebsite(t, app, "Demo", "demo.local")
+	_, token := seedUser(t, app, "analyst", roleAnalyst, []WebsitePermission{{WebsiteID: websiteID, AccessLevel: "view"}})
+
+	requestFor := func() *http.Request {
+		req := httptest.NewRequest("POST", "/api/send", nil)
+		req.RemoteAddr = "203.0.113.20:4321"
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+		return req
+	}
+
+	seed := []eventRequest{
+		{Type: "pageview", Payload: eventPayload{Website: websiteID, URL: "https://demo.local/", ID: "visitor-1"}},
+		{Type: "event", Payload: eventPayload{Website: websiteID, URL: "https://demo.local/", ID: "visitor-1", Name: "signup"}},
+		{Type: "pageview", Payload: eventPayload{Website: websiteID, URL: "https://demo.local/pricing", ID: "visitor-1"}},
+		{Type: "revenue", Payload: eventPayload{Website: websiteID, URL: "https://demo.local/checkout", ID: "visitor-1", Revenue: &RevenueInput{Amount: 10, Currency: "USD"}}},
+	}
+	for _, item := range seed {
+		if _, err := app.recordEvent(requestFor(), item); err != nil {
+			t.Fatalf("record event: %v", err)
+		}
+	}
+
+	waitFor(t, 3*time.Second, func() bool {
+		var count int
+		if err := app.db.QueryRow(`select count(*) from events where website_id = ?`, websiteID).Scan(&count); err != nil {
+			return false
+		}
+		return count == len(seed)
+	})
+
+	day := nowUTC().Format("2006-01-02")
+	req := authedJSONRequest(t, http.MethodGet, "/api/analytics/overview?website_id="+websiteID+"&from="+day+"&to="+day, nil, token)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var payload struct {
+		Overview struct {
+			Events int64 `json:"events"`
+		} `json:"overview"`
+		Trend []struct {
+			Events int64 `json:"events"`
+		} `json:"trend"`
+		Compare struct {
+			Metrics struct {
+				Events struct {
+					Current int64 `json:"current"`
+				} `json:"events"`
+			} `json:"metrics"`
+		} `json:"compare"`
+	}
+	decodeTestJSON(t, rec.Body.Bytes(), &payload)
+	if payload.Overview.Events != 4 {
+		t.Fatalf("expected overview total events to be 4, got %d", payload.Overview.Events)
+	}
+	if len(payload.Trend) != 1 || payload.Trend[0].Events != 4 {
+		t.Fatalf("expected trend total events to be 4, got %#v", payload.Trend)
+	}
+	if payload.Compare.Metrics.Events.Current != 4 {
+		t.Fatalf("expected compare current events to be 4, got %d", payload.Compare.Metrics.Events.Current)
+	}
+}
+
+func TestHandleBatchRateLimitsEachWebsite(t *testing.T) {
+	app := newTestApp(t)
+	websiteA := seedWebsite(t, app, "A", "a.local")
+	websiteB := seedWebsite(t, app, "B", "b.local")
+
+	app.rateMu.Lock()
+	app.rateBuckets["collection:website:"+websiteB] = rateBucket{
+		Count:   1200,
+		ResetAt: nowUTC().Add(time.Minute),
+	}
+	app.rateMu.Unlock()
+
+	body := []byte(`[
+		{"type":"pageview","payload":{"website":"` + websiteA + `","url":"https://a.local/","id":"visitor-a"}},
+		{"type":"pageview","payload":{"website":"` + websiteB + `","url":"https://b.local/","id":"visitor-b"}}
+	]`)
+	req := httptest.NewRequest(http.MethodPost, "/api/batch", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.RemoteAddr = "203.0.113.20:4321"
+	rec := httptest.NewRecorder()
+
+	app.handleBatch(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 

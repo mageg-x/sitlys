@@ -317,7 +317,11 @@ export function createAppController({ t, localeRef }) {
       String(item.campaign || "").toLowerCase().includes(query)
     );
   });
-  const overviewTrendMax = computed(() => Math.max(...state.overviewTrend.map(item => Number(item.pageviews || 0)), 1));
+  const overviewTrendPeaks = computed(() => ({
+    pageviews: Math.max(...state.overviewTrend.map(item => Number(item.pageviews || 0)), 1),
+    events: Math.max(...state.overviewTrend.map(item => Number(item.events || 0)), 1),
+    revenue: Math.max(...state.overviewTrend.map(item => Number(item.revenue || 0)), 1),
+  }));
 
   const overviewHighlights = computed(() => {
     const pageviews = Number(state.overview.pageviews || 0);
@@ -878,7 +882,7 @@ export function createAppController({ t, localeRef }) {
     filteredReferrers,
     filteredRevenue,
     filteredAttribution,
-    overviewTrendMax,
+    overviewTrendPeaks,
     realtimeHighlights,
     overviewHighlights,
     pageHighlights,

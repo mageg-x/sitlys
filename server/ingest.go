@@ -328,21 +328,25 @@ func (a *App) updateAggregatesTx(tx *sql.Tx, record eventRecord, session session
 			return err
 		}
 	} else if record.Amount > 0 {
-		referrer := record.ReferrerDomain
+		referrer := session.ReferrerDomain
 		if referrer == "" {
 			referrer = "(direct)"
 		}
 		if _, err := tx.Exec(`
-			update agg_referrers_daily set revenue = revenue + ?
-			where website_id = ? and bucket_date = ? and referrer_domain = ?
-		`, record.Amount, record.WebsiteID, day, referrer); err != nil {
+			insert into agg_referrers_daily(website_id, bucket_date, referrer_domain, sessions, revenue)
+			values(?, ?, ?, 0, ?)
+			on conflict(website_id, bucket_date, referrer_domain) do update set
+				revenue = revenue + excluded.revenue
+		`, record.WebsiteID, day, referrer, record.Amount); err != nil {
 			return err
 		}
 		source, medium, campaign := attributionKey(session)
 		if _, err := tx.Exec(`
-			update agg_attribution_daily set revenue = revenue + ?
-			where website_id = ? and bucket_date = ? and source = ? and medium = ? and campaign = ?
-		`, record.Amount, record.WebsiteID, day, source, medium, campaign); err != nil {
+			insert into agg_attribution_daily(website_id, bucket_date, source, medium, campaign, sessions, revenue)
+			values(?, ?, ?, ?, ?, 0, ?)
+			on conflict(website_id, bucket_date, source, medium, campaign) do update set
+				revenue = revenue + excluded.revenue
+		`, record.WebsiteID, day, source, medium, campaign, record.Amount); err != nil {
 			return err
 		}
 	}

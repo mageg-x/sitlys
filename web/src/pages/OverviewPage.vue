@@ -132,7 +132,11 @@
       </div>
       <div v-if="app.state.overviewTrend.length" class="mini-series">
         <div v-for="row in app.state.overviewTrend" :key="row.date" class="mini-series-col">
-          <div class="mini-series-bar" :style="{ height: `${Math.max(10, (Number(row.pageviews || 0) / app.overviewTrendMax) * 100)}%` }"></div>
+          <div class="mini-series-stack">
+            <div class="mini-series-bar pageviews" :style="{ height: `${Math.max(10, (Number(row.pageviews || 0) / app.overviewTrendPeaks.pageviews) * 100)}%` }"></div>
+            <div class="mini-series-bar events" :style="{ height: `${Math.max(10, (Number(row.events || 0) / app.overviewTrendPeaks.events) * 100)}%` }"></div>
+            <div class="mini-series-bar revenue" :style="{ height: `${Math.max(10, (Number(row.revenue || 0) / app.overviewTrendPeaks.revenue) * 100)}%` }"></div>
+          </div>
           <span>{{ row.date.slice(5) }}</span>
         </div>
       </div>
@@ -242,6 +246,26 @@ const app = useAppController();
 
 .compare-card em.down {
   color: #be123c;
+}
+
+.mini-series-stack {
+  display: flex;
+  align-items: end;
+  justify-content: center;
+  gap: 0.18rem;
+  min-height: 6.5rem;
+}
+
+.mini-series-bar.pageviews {
+  background: linear-gradient(180deg, rgba(32, 81, 225, 0.96), rgba(64, 124, 255, 0.65));
+}
+
+.mini-series-bar.events {
+  background: linear-gradient(180deg, rgba(12, 136, 126, 0.96), rgba(70, 202, 190, 0.68));
+}
+
+.mini-series-bar.revenue {
+  background: linear-gradient(180deg, rgba(194, 108, 12, 0.96), rgba(255, 176, 71, 0.72));
 }
 
 .realtime-series {

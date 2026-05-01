@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/csv"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/fs"
 	"net/http"
@@ -981,16 +980,18 @@ func (a *App) handleBatch(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	websiteID := ""
+	websiteCounts := make(map[string]int)
 	for _, req := range reqs {
-		websiteID = strings.TrimSpace(firstNonEmpty(req.Payload.Website, a.websiteForPixel(strings.TrimSpace(req.Payload.Pixel))))
+		websiteID := strings.TrimSpace(firstNonEmpty(req.Payload.Website, a.websiteForPixel(strings.TrimSpace(req.Payload.Pixel))))
 		if websiteID != "" {
-			break
+			websiteCounts[websiteID]++
 		}
 	}
-	if websiteID != "" && !a.allowCollectionRequest(r, websiteID, len(reqs)) {
-		errorResponse(w, http.StatusTooManyRequests, "rate limit exceeded")
-		return
+	for websiteID, count := range websiteCounts {
+		if !a.allowCollectionRequest(r, websiteID, count) {
+			errorResponse(w, http.StatusTooManyRequests, "rate limit exceeded")
+			return
+		}
 	}
 	results := make([]map[string]any, 0, len(reqs))
 	for _, req := range reqs {
@@ -1253,91 +1254,6 @@ func (a *App) websiteForPixel(pixelID string) string {
 	return websiteID
 }
 
-func (a *App) upsertVisitor(websiteID, externalID string, seenAt time.Time) (string, error) {
-	var visitorID string
-	err := a.db.QueryRow(`
-		select id
-		from visitors
-		where website_id = ? and external_id = ?
-	`, websiteID, externalID).Scan(&visitorID)
-	switch {
-	case err == nil:
-		_, err = a.db.Exec(`update visitors set last_seen_at = ? where id = ?`, iso(seenAt), visitorID)
-		return visitorID, err
-	case !errors.Is(err, sql.ErrNoRows):
-		return "", err
-	}
-	visitorID = newID()
-	_, err = a.db.Exec(`
-		insert into visitors(id, website_id, external_id, first_seen_at, last_seen_at)
-		values(?, ?, ?, ?, ?)
-	`, visitorID, websiteID, externalID, iso(seenAt), iso(seenAt))
-	return visitorID, err
-}
-
-func (a *App) findOrCreateSession(candidate sessionRecord) (sessionRecord, error) {
-	var existing sessionRecord
-	var startedAtText, lastSeenText string
-	row := a.db.QueryRow(`
-		select id, website_id, visitor_id, started_at, last_seen_at, event_count, pageviews,
-		       referrer, referrer_domain, utm_source, utm_medium, utm_campaign,
-		       browser, os, device, country, region, city, entry_path, exit_path
-		from sessions
-		where website_id = ? and visitor_id = ?
-		order by last_seen_at desc
-		limit 1
-	`, candidate.WebsiteID, candidate.VisitorID)
-	err := row.Scan(
-		&existing.ID, &existing.WebsiteID, &existing.VisitorID, &startedAtText, &lastSeenText,
-		&existing.EventCount, &existing.Pageviews, &existing.Referrer, &existing.ReferrerDomain,
-		&existing.UTMSource, &existing.UTMMedium, &existing.UTMCampaign, &existing.Browser,
-		&existing.OS, &existing.Device, &existing.Country, &existing.Region, &existing.City,
-		&existing.EntryPath, &existing.ExitPath,
-	)
-	if err == nil {
-		existing.StartedAt = parseISO(startedAtText)
-		existing.LastSeenAt = parseISO(lastSeenText)
-	}
-	if err == nil && candidate.StartedAt.Sub(existing.LastSeenAt) <= 30*time.Minute {
-		existing.LastSeenAt = candidate.LastSeenAt
-		if candidate.ExitPath != "" {
-			existing.ExitPath = candidate.ExitPath
-		}
-		existing.EventCount++
-		if candidate.Pageviews > 0 {
-			existing.Pageviews++
-		}
-		_, err := a.db.Exec(`
-			update sessions
-			set last_seen_at = ?, event_count = ?, pageviews = ?, exit_path = ?
-			where id = ?
-		`, iso(existing.LastSeenAt), existing.EventCount, existing.Pageviews, existing.ExitPath, existing.ID)
-		return existing, err
-	}
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return sessionRecord{}, err
-	}
-
-	candidate.ID = newID()
-	candidate.EventCount = 1
-	if candidate.Pageviews > 0 {
-		candidate.Pageviews = 1
-	}
-	_, err = a.db.Exec(`
-		insert into sessions(
-			id, website_id, visitor_id, started_at, last_seen_at, event_count, pageviews,
-			referrer, referrer_domain, utm_source, utm_medium, utm_campaign,
-			browser, os, device, country, region, city, entry_path, exit_path
-		) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`,
-		candidate.ID, candidate.WebsiteID, candidate.VisitorID, iso(candidate.StartedAt), iso(candidate.LastSeenAt),
-		candidate.EventCount, candidate.Pageviews, candidate.Referrer, candidate.ReferrerDomain,
-		candidate.UTMSource, candidate.UTMMedium, candidate.UTMCampaign, candidate.Browser, candidate.OS,
-		candidate.Device, candidate.Country, candidate.Region, candidate.City, candidate.EntryPath, candidate.ExitPath,
-	)
-	return candidate, err
-}
-
 func (a *App) insertEvent(record eventRecord) error {
 	_, err := a.db.Exec(`
 		insert into events(
@@ -1397,6 +1313,7 @@ func (a *App) handleOverview(w http.ResponseWriter, r *http.Request) {
 		Revenue   float64 `json:"revenue"`
 	}
 	var out overview
+	var customEvents int64
 	if err := a.db.QueryRow(`
 		select
 			coalesce(sum(pageviews), 0),
@@ -1404,10 +1321,11 @@ func (a *App) handleOverview(w http.ResponseWriter, r *http.Request) {
 			coalesce(sum(revenue), 0)
 		from agg_overview_daily
 		where website_id = ? and bucket_date between ? and ?
-	`, websiteID, from.Format("2006-01-02"), to.Format("2006-01-02")).Scan(&out.Pageviews, &out.Events, &out.Revenue); err != nil {
+	`, websiteID, from.Format("2006-01-02"), to.Format("2006-01-02")).Scan(&out.Pageviews, &customEvents, &out.Revenue); err != nil {
 		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	out.Events = out.Pageviews + customEvents
 	if err := a.db.QueryRow(`
 		select count(distinct visitor_id), count(*)
 		from sessions
@@ -1430,16 +1348,16 @@ func (a *App) handleOverview(w http.ResponseWriter, r *http.Request) {
 	var trend []map[string]any
 	for trendRows.Next() {
 		var day string
-		var pageviews, events int64
+		var pageviews, customEvents int64
 		var revenue float64
-		if err := trendRows.Scan(&day, &pageviews, &events, &revenue); err != nil {
+		if err := trendRows.Scan(&day, &pageviews, &customEvents, &revenue); err != nil {
 			errorResponse(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		trend = append(trend, map[string]any{
 			"date":      day,
 			"pageviews": pageviews,
-			"events":    events,
+			"events":    pageviews + customEvents,
 			"revenue":   revenue,
 		})
 	}
@@ -2207,13 +2125,15 @@ func (a *App) loadOverviewCompare(websiteID string, from, to time.Time) (map[str
 		Revenue   float64
 	}
 	var current, previous overview
+	var currentCustomEvents, previousCustomEvents int64
 	if err := a.db.QueryRow(`
 		select coalesce(sum(pageviews), 0), coalesce(sum(custom_events), 0), coalesce(sum(revenue), 0)
 		from agg_overview_daily
 		where website_id = ? and bucket_date between ? and ?
-	`, websiteID, from.Format("2006-01-02"), to.Format("2006-01-02")).Scan(&current.Pageviews, &current.Events, &current.Revenue); err != nil {
+	`, websiteID, from.Format("2006-01-02"), to.Format("2006-01-02")).Scan(&current.Pageviews, &currentCustomEvents, &current.Revenue); err != nil {
 		return nil, err
 	}
+	current.Events = current.Pageviews + currentCustomEvents
 	if err := a.db.QueryRow(`
 		select count(distinct visitor_id), count(*)
 		from sessions
@@ -2225,9 +2145,10 @@ func (a *App) loadOverviewCompare(websiteID string, from, to time.Time) (map[str
 		select coalesce(sum(pageviews), 0), coalesce(sum(custom_events), 0), coalesce(sum(revenue), 0)
 		from agg_overview_daily
 		where website_id = ? and bucket_date between ? and ?
-	`, websiteID, prevFrom.Format("2006-01-02"), prevTo.Format("2006-01-02")).Scan(&previous.Pageviews, &previous.Events, &previous.Revenue); err != nil {
+	`, websiteID, prevFrom.Format("2006-01-02"), prevTo.Format("2006-01-02")).Scan(&previous.Pageviews, &previousCustomEvents, &previous.Revenue); err != nil {
 		return nil, err
 	}
+	previous.Events = previous.Pageviews + previousCustomEvents
 	if err := a.db.QueryRow(`
 		select count(distinct visitor_id), count(*)
 		from sessions
@@ -2491,7 +2412,7 @@ func (a *App) publicOverview(websiteID string, from, to time.Time) map[string]an
 			sum(case when event_type = 'pageview' then 1 else 0 end) as pageviews,
 			count(distinct visitor_id) as visitors,
 			count(distinct session_id) as sessions,
-			sum(case when event_type <> 'pageview' then 1 else 0 end) as events,
+			count(*) as events,
 			sum(amount) as revenue
 		from events
 		where website_id = ? and created_at between ? and ?

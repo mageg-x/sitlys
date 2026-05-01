@@ -12,6 +12,11 @@ export function formatPercent(value) {
   return `${(Number(value || 0) * 100).toFixed(1)}%`;
 }
 
-export function formatMoney(value, currency = "N/A") {
-  return `${currency} ${Number(value || 0).toFixed(2)}`;
+export function formatMoney(value, currency = "") {
+  const normalized = String(currency || "").trim().toUpperCase();
+  const amount = Number(value || 0).toFixed(2);
+  if (!normalized || normalized === "N/A") {
+    return amount;
+  }
+  return `${normalized} ${amount}`;
 }
