@@ -61,6 +61,8 @@ type App struct {
 	workerWG    sync.WaitGroup
 	rateMu      sync.Mutex
 	rateBuckets map[string]rateBucket
+	botAuditMu  sync.Mutex
+	botAudit    map[string]int
 }
 
 type AuthUser struct {
@@ -122,6 +124,7 @@ type SystemSettings struct {
 	DatabasePath      string `json:"database_path"`
 	LogLevel          string `json:"log_level"`
 	DataRetentionDays int    `json:"data_retention_days"`
+	BotFilterMode     string `json:"bot_filter_mode"`
 	LastCleanupAt     string `json:"last_cleanup_at"`
 	UpdatedAt         string `json:"updated_at"`
 }
@@ -291,6 +294,7 @@ func New(cfg Config) (*App, error) {
 		db:          db,
 		eventQueue:  make(chan queuedEvent, 8192),
 		rateBuckets: make(map[string]rateBucket),
+		botAudit:    make(map[string]int),
 	}
 	if err := app.initSchema(); err != nil {
 		db.Close()
@@ -721,6 +725,12 @@ func decodeJSON(r *http.Request, target any) error {
 	return dec.Decode(target)
 }
 
+func decodeCollectionJSON(r *http.Request, target any) error {
+	defer r.Body.Close()
+	dec := json.NewDecoder(r.Body)
+	return dec.Decode(target)
+}
+
 func (a *App) hasUsers() (bool, error) {
 	var count int
 	if err := a.db.QueryRow(`select count(*) from users`).Scan(&count); err != nil {
@@ -752,6 +762,22 @@ func (a *App) clearSessionCookie(w http.ResponseWriter) {
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+}
+
+func (a *App) clearSessionCookieForRequest(w http.ResponseWriter, r *http.Request) {
+	secure := false
+	if r != nil {
+		secure = r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   secure,
 		MaxAge:   -1,
 	})
 }
@@ -1041,12 +1067,28 @@ func isBotTraffic(userAgent string) bool {
 		"semrush",
 		"bytespider",
 		"applebot",
+		"python-requests",
+		"go-http-client",
+	} {
+		if strings.Contains(ua, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPreviewBotTraffic(userAgent string) bool {
+	ua := strings.ToLower(strings.TrimSpace(userAgent))
+	if ua == "" {
+		return false
+	}
+	for _, token := range []string{
 		"discordbot",
 		"telegrambot",
 		"whatsapp",
 		"slackbot",
-		"python-requests",
-		"go-http-client",
+		"facebookexternalhit",
+		"linkedinbot",
 	} {
 		if strings.Contains(ua, token) {
 			return true
@@ -1130,6 +1172,7 @@ func (a *App) getSystemSettings() (SystemSettings, error) {
 		DatabasePath:      a.cfg.DBPath,
 		LogLevel:          "info",
 		DataRetentionDays: 365,
+		BotFilterMode:     "balanced",
 	}
 	rows, err := a.db.Query(`
 		select key, value, updated_at
@@ -1155,6 +1198,10 @@ func (a *App) getSystemSettings() (SystemSettings, error) {
 		case "data_retention_days":
 			if days, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && days > 0 {
 				settings.DataRetentionDays = days
+			}
+		case "bot_filter_mode":
+			if strings.TrimSpace(value) != "" {
+				settings.BotFilterMode = strings.TrimSpace(value)
 			}
 		case "last_cleanup_at":
 			settings.LastCleanupAt = value
@@ -1195,6 +1242,11 @@ func (a *App) createBackup() (string, error) {
 	}
 	filename := fmt.Sprintf("sitlys-%s.db", nowUTC().Format("20060102-150405"))
 	targetPath := filepath.Join(backupDir, filename)
+	cleanBackupDir := filepath.Clean(backupDir)
+	cleanTargetPath := filepath.Clean(targetPath)
+	if filepath.Dir(cleanTargetPath) != cleanBackupDir {
+		return "", fmt.Errorf("invalid backup target path")
+	}
 	escaped := strings.ReplaceAll(targetPath, "'", "''")
 
 	if _, err := a.db.Exec(`pragma wal_checkpoint(full);`); err != nil {
@@ -1204,6 +1256,67 @@ func (a *App) createBackup() (string, error) {
 		return "", err
 	}
 	return targetPath, nil
+}
+
+func normalizeEventCreatedAt(timestamp int64, now time.Time) time.Time {
+	createdAt := now
+	if timestamp == 0 {
+		return createdAt
+	}
+	if timestamp > 1_000_000_000_000 {
+		createdAt = time.UnixMilli(timestamp).UTC()
+	} else {
+		createdAt = time.Unix(timestamp, 0).UTC()
+	}
+	if createdAt.Before(now.Add(-7*24*time.Hour)) || createdAt.After(now.Add(10*time.Minute)) {
+		return now
+	}
+	return createdAt
+}
+
+func (a *App) shouldIgnoreBotTraffic(r *http.Request) (bool, string) {
+	settings := SystemSettings{BotFilterMode: "balanced"}
+	if a != nil && a.db != nil {
+		if loaded, err := a.getSystemSettings(); err == nil {
+			settings = loaded
+		}
+	}
+	mode := strings.TrimSpace(strings.ToLower(settings.BotFilterMode))
+	if mode == "" {
+		mode = "balanced"
+	}
+	if mode == "off" {
+		return false, ""
+	}
+	if isBotRequest(r) {
+		return true, "prefetch"
+	}
+	if isBotTraffic(r.UserAgent()) {
+		return true, "bot"
+	}
+	if mode == "strict" && isPreviewBotTraffic(r.UserAgent()) {
+		return true, "preview_bot"
+	}
+	return false, ""
+}
+
+func (a *App) recordBotAudit(reason string) {
+	if reason == "" {
+		return
+	}
+	a.botAuditMu.Lock()
+	defer a.botAuditMu.Unlock()
+	a.botAudit[reason]++
+}
+
+func (a *App) botAuditSnapshot() map[string]int {
+	a.botAuditMu.Lock()
+	defer a.botAuditMu.Unlock()
+	out := make(map[string]int, len(a.botAudit))
+	for key, value := range a.botAudit {
+		out[key] = value
+	}
+	return out
 }
 
 func (a *App) allowRateLimit(key string, limit, cost int, window time.Duration) bool {

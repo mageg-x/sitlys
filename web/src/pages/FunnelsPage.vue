@@ -83,7 +83,8 @@
         <div class="funnel-stats">
           <span>{{ step.sessions }} {{ app.t("sessions") }}</span>
           <span>{{ app.formatPercent(step.conversion) }}</span>
-          <span>{{ app.t("dropOff") }} · {{ app.formatPercent(1 - step.conversion) }}</span>
+          <span>{{ app.t("dropOff") }} · {{ app.formatNumber(step.drop_off_count || 0) }}</span>
+          <span>{{ app.t("dropOffRate") }} · {{ app.formatPercent(step.drop_off_rate || 0) }}</span>
         </div>
       </div>
     </div>

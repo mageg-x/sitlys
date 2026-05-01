@@ -83,6 +83,14 @@
             <span>{{ app.t("dataRetentionDays") }}</span>
             <input v-model.number="app.settingsForm.data_retention_days" type="number" min="7" step="1" required />
           </label>
+          <label>
+            <span>{{ app.t("botFilterMode") }}</span>
+            <select v-model="app.settingsForm.bot_filter_mode">
+              <option value="off">{{ app.t("botFilterOff") }}</option>
+              <option value="balanced">{{ app.t("botFilterBalanced") }}</option>
+              <option value="strict">{{ app.t("botFilterStrict") }}</option>
+            </select>
+          </label>
           <div class="form-actions">
             <button class="primary-button">{{ app.t("save") }}</button>
           </div>
@@ -112,6 +120,22 @@
         </div>
       </article>
     </div>
+
+    <article v-if="app.isSuperAdmin" class="panel workspace-panel">
+      <div class="panel-head">
+        <div>
+          <h3>{{ app.t("botAuditPanel") }}</h3>
+          <p>{{ app.t("botAuditText") }}</p>
+        </div>
+      </div>
+      <div v-if="Object.keys(app.state.botAudit || {}).length" class="audit-grid">
+        <div v-for="(value, key) in app.state.botAudit" :key="key" class="audit-card">
+          <span>{{ key }}</span>
+          <strong>{{ app.formatNumber(value) }}</strong>
+        </div>
+      </div>
+      <p v-else class="empty-note">{{ app.t("noData") }}</p>
+    </article>
   </section>
 </template>
 
@@ -153,6 +177,28 @@ const app = useAppController();
 .ops-stack {
   display: grid;
   gap: 1rem;
+}
+
+.audit-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  gap: 0.8rem;
+}
+
+.audit-card {
+  display: grid;
+  gap: 0.3rem;
+  padding: 0.95rem 1rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.audit-card span {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 0.74rem;
 }
 
 .helper-block p {

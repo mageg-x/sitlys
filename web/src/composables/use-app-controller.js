@@ -62,6 +62,7 @@ export function createAppController({ t, localeRef }) {
     users: [],
     publicShare: null,
     settings: null,
+    botAudit: {},
     backupPath: "",
     cleanupResult: null,
     realtime: null,
@@ -93,6 +94,7 @@ export function createAppController({ t, localeRef }) {
     database_path: "",
     log_level: "info",
     data_retention_days: 365,
+    bot_filter_mode: "balanced",
   });
   const pageFilter = reactive({ query: "" });
   const eventFilter = reactive({ query: "" });
@@ -327,7 +329,7 @@ export function createAppController({ t, localeRef }) {
       {
         key: "sessions-per-pageview",
         label: t("sessionsPerPageview"),
-        value: pageviews ? formatPercent(sessions / pageviews) : "0.0%",
+        value: sessions ? Number(pageviews / sessions).toFixed(2) : "0.00",
         tone: "indigo",
       },
       {

@@ -82,6 +82,14 @@ func (a *App) applyQueuedEvent(tx *sql.Tx, item queuedEvent) error {
 	if err != nil {
 		return err
 	}
+	pageviews := 0
+	entryPath := ""
+	exitPath := ""
+	if item.EventType == "pageview" && item.URLPath != "" {
+		pageviews = 1
+		entryPath = item.URLPath
+		exitPath = item.URLPath
+	}
 	session, isNewSession, err := a.findOrCreateSessionTx(tx, sessionRecord{
 		WebsiteID:      item.WebsiteID,
 		VisitorID:      visitorID,
@@ -98,8 +106,9 @@ func (a *App) applyQueuedEvent(tx *sql.Tx, item queuedEvent) error {
 		Country:        item.Country,
 		Region:         item.Region,
 		City:           item.City,
-		EntryPath:      item.URLPath,
-		ExitPath:       item.URLPath,
+		Pageviews:      pageviews,
+		EntryPath:      entryPath,
+		ExitPath:       exitPath,
 	})
 	if err != nil {
 		return err
@@ -187,9 +196,11 @@ func (a *App) findOrCreateSessionTx(tx *sql.Tx, candidate sessionRecord) (sessio
 	}
 	if err == nil && candidate.StartedAt.Sub(existing.LastSeenAt) <= 30*time.Minute {
 		existing.LastSeenAt = candidate.LastSeenAt
-		existing.ExitPath = candidate.ExitPath
+		if candidate.ExitPath != "" {
+			existing.ExitPath = candidate.ExitPath
+		}
 		existing.EventCount++
-		if candidate.URLPathLikePageview() {
+		if candidate.Pageviews > 0 {
 			existing.Pageviews++
 		}
 		_, err := tx.Exec(`
@@ -205,7 +216,7 @@ func (a *App) findOrCreateSessionTx(tx *sql.Tx, candidate sessionRecord) (sessio
 
 	candidate.ID = newID()
 	candidate.EventCount = 1
-	if candidate.EntryPath != "" {
+	if candidate.Pageviews > 0 {
 		candidate.Pageviews = 1
 	}
 	_, err = tx.Exec(`
@@ -221,10 +232,6 @@ func (a *App) findOrCreateSessionTx(tx *sql.Tx, candidate sessionRecord) (sessio
 		candidate.Device, candidate.Country, candidate.Region, candidate.City, candidate.EntryPath, candidate.ExitPath,
 	)
 	return candidate, true, err
-}
-
-func (s sessionRecord) URLPathLikePageview() bool {
-	return s.EntryPath != ""
 }
 
 func (a *App) insertEventTx(tx *sql.Tx, record eventRecord) error {

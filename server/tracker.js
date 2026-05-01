@@ -56,5 +56,5 @@
     }
   };
 
-  collect("event", basePayload());
+  collect("pageview", basePayload());
 })();

@@ -73,6 +73,7 @@ type settingsInput struct {
 	DatabasePath      string `json:"database_path"`
 	LogLevel          string `json:"log_level"`
 	DataRetentionDays int    `json:"data_retention_days"`
+	BotFilterMode     string `json:"bot_filter_mode"`
 }
 
 func (a *App) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -224,7 +225,7 @@ func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		_, _ = a.db.Exec(`delete from auth_sessions where token_hash = ?`, tokenHash(cookie.Value))
 	}
-	a.clearSessionCookie(w)
+	a.clearSessionCookieForRequest(w, r)
 	jsonResponse(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -246,7 +247,7 @@ func (a *App) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req changePasswordRequest
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeCollectionJSON(r, &req); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -975,7 +976,7 @@ func (a *App) handleBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var reqs []eventRequest
-	if err := decodeJSON(r, &reqs); err != nil {
+	if err := decodeCollectionJSON(r, &reqs); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -1020,9 +1021,10 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		jsonResponse(w, http.StatusOK, map[string]any{
-			"ok":       true,
-			"settings": settings,
-			"version":  version,
+			"ok":        true,
+			"settings":  settings,
+			"version":   version,
+			"bot_audit": a.botAuditSnapshot(),
 		})
 	case http.MethodPut:
 		var req settingsInput
@@ -1033,6 +1035,7 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) {
 		req.ListenAddr = strings.TrimSpace(req.ListenAddr)
 		req.DatabasePath = strings.TrimSpace(req.DatabasePath)
 		req.LogLevel = strings.TrimSpace(strings.ToLower(req.LogLevel))
+		req.BotFilterMode = strings.TrimSpace(strings.ToLower(req.BotFilterMode))
 
 		if req.ListenAddr == "" || req.DatabasePath == "" {
 			errorResponse(w, http.StatusBadRequest, "listen_addr and database_path required")
@@ -1040,6 +1043,9 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.LogLevel == "" {
 			req.LogLevel = "info"
+		}
+		if req.BotFilterMode == "" {
+			req.BotFilterMode = "balanced"
 		}
 		retentionDays := req.DataRetentionDays
 		if retentionDays <= 0 {
@@ -1053,6 +1059,7 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) {
 			"database_path":       req.DatabasePath,
 			"log_level":           req.LogLevel,
 			"data_retention_days": strconv.Itoa(retentionDays),
+			"bot_filter_mode":     req.BotFilterMode,
 		}); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "save settings failed")
 			return
@@ -1109,7 +1116,7 @@ func (a *App) recordEvent(r *http.Request, req eventRequest) (map[string]any, er
 	if req.Type == "" {
 		req.Type = "event"
 	}
-	if req.Type != "event" && req.Type != "revenue" && req.Type != "identify" {
+	if req.Type != "event" && req.Type != "revenue" && req.Type != "identify" && req.Type != "pageview" {
 		return nil, fmt.Errorf("unsupported event type")
 	}
 
@@ -1136,14 +1143,7 @@ func (a *App) recordEvent(r *http.Request, req eventRequest) (map[string]any, er
 		return nil, fmt.Errorf("website not found")
 	}
 
-	createdAt := nowUTC()
-	if payload.Timestamp != 0 {
-		if payload.Timestamp > 1_000_000_000_000 {
-			createdAt = time.UnixMilli(payload.Timestamp).UTC()
-		} else {
-			createdAt = time.Unix(payload.Timestamp, 0).UTC()
-		}
-	}
+	createdAt := normalizeEventCreatedAt(payload.Timestamp, nowUTC())
 
 	fullURL := payload.URL
 	if fullURL == "" {
@@ -1156,11 +1156,12 @@ func (a *App) recordEvent(r *http.Request, req eventRequest) (map[string]any, er
 	refDomain := referrerDomain(payload.Referrer)
 	browser, osName, device := detectUserAgent(r, payload)
 	country, region, city := detectGeo(r, payload)
-	if isBotTraffic(r.UserAgent()) || isBotRequest(r) {
+	if ignored, reason := a.shouldIgnoreBotTraffic(r); ignored {
+		a.recordBotAudit(reason)
 		return map[string]any{
 			"website_id": websiteID,
 			"ignored":    true,
-			"reason":     "bot",
+			"reason":     reason,
 		}, nil
 	}
 	if payload.Hostname != "" {
@@ -1298,7 +1299,9 @@ func (a *App) findOrCreateSession(candidate sessionRecord) (sessionRecord, error
 	}
 	if err == nil && candidate.StartedAt.Sub(existing.LastSeenAt) <= 30*time.Minute {
 		existing.LastSeenAt = candidate.LastSeenAt
-		existing.ExitPath = candidate.ExitPath
+		if candidate.ExitPath != "" {
+			existing.ExitPath = candidate.ExitPath
+		}
 		existing.EventCount++
 		if candidate.EntryPath != "" {
 			existing.Pageviews++
@@ -2354,16 +2357,26 @@ func (a *App) runFunnel(funnel Funnel, from, to time.Time) (map[string]any, erro
 	}
 	for i, step := range funnel.Steps {
 		conversion := 0.0
+		dropOffCount := 0
+		dropOffRate := 0.0
 		if firstCount > 0 {
 			conversion = float64(counts[i]) / float64(firstCount)
 		}
+		if i > 0 {
+			dropOffCount = counts[i-1] - counts[i]
+			if counts[i-1] > 0 {
+				dropOffRate = float64(dropOffCount) / float64(counts[i-1])
+			}
+		}
 		steps = append(steps, map[string]any{
-			"index":      i + 1,
-			"label":      step.Label,
-			"type":       step.Type,
-			"value":      step.Value,
-			"sessions":   counts[i],
-			"conversion": conversion,
+			"index":          i + 1,
+			"label":          step.Label,
+			"type":           step.Type,
+			"value":          step.Value,
+			"sessions":       counts[i],
+			"conversion":     conversion,
+			"drop_off_count": dropOffCount,
+			"drop_off_rate":  dropOffRate,
 		})
 	}
 	return map[string]any{
@@ -2378,12 +2391,34 @@ func matchesStep(step FunnelStep, item struct {
 }) bool {
 	switch step.Type {
 	case "page":
-		return item.Path == step.Value
+		return pathMatchesStepValue(item.Path, step.Value)
 	case "event":
-		return item.Name == step.Value
+		return strings.EqualFold(strings.TrimSpace(item.Name), strings.TrimSpace(step.Value))
 	default:
 		return false
 	}
+}
+
+func pathMatchesStepValue(pathValue, expected string) bool {
+	pathValue = strings.TrimSpace(pathValue)
+	expected = strings.TrimSpace(expected)
+	if pathValue == expected {
+		return true
+	}
+	if expected == "" {
+		return false
+	}
+	if strings.HasSuffix(expected, "/**") {
+		prefix := strings.TrimSuffix(expected, "**")
+		return strings.HasPrefix(pathValue, prefix)
+	}
+	if strings.HasSuffix(expected, "/*") {
+		prefix := strings.TrimSuffix(expected, "*")
+		return strings.HasPrefix(pathValue, prefix)
+	}
+	expected = strings.TrimRight(expected, "/")
+	pathValue = strings.TrimRight(pathValue, "/")
+	return pathValue == expected
 }
 
 func (a *App) handlePublicShare(w http.ResponseWriter, r *http.Request) {

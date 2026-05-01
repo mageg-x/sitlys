@@ -49,11 +49,13 @@ export function createAdminActions(ctx) {
     if (!isSuperAdmin.value) return;
     const data = await safeRequest("/api/settings");
     state.settings = data?.settings || null;
+    state.botAudit = data?.bot_audit || {};
     if (state.settings) {
       settingsForm.listen_addr = state.settings.listen_addr || "";
       settingsForm.database_path = state.settings.database_path || "";
       settingsForm.log_level = state.settings.log_level || "info";
       settingsForm.data_retention_days = state.settings.data_retention_days || 365;
+      settingsForm.bot_filter_mode = state.settings.bot_filter_mode || "balanced";
     }
   }
 
@@ -185,6 +187,7 @@ export function createAdminActions(ctx) {
           database_path: settingsForm.database_path,
           log_level: settingsForm.log_level,
           data_retention_days: Number(settingsForm.data_retention_days || 365),
+          bot_filter_mode: settingsForm.bot_filter_mode || "balanced",
         },
       });
       await loadSettings();
