@@ -291,6 +291,7 @@ const app = useAppController();
   color: var(--accent-strong);
   font-size: 0.78rem;
   font-weight: 700;
+  white-space: nowrap;
 }
 
 .role-guide {

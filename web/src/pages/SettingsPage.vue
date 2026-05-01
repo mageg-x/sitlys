@@ -4,7 +4,7 @@
       <div class="panel-head analytics-head">
         <div>
           <h3>{{ app.t("systemSnapshot") }}</h3>
-          <p>{{ app.t("systemSnapshotText") }}</p>
+          <p>{{ app.t("settingsPageText") }}</p>
         </div>
       </div>
       <div class="signal-grid compact-signal-grid">
@@ -13,43 +13,18 @@
           <strong>{{ app.state.version || "0.1.0" }}</strong>
         </div>
         <div class="signal-card teal">
-          <span>{{ app.t("websites") }}</span>
-          <strong>{{ app.formatNumber(app.state.websites.length) }}</strong>
+          <span>{{ app.t("runtimeStack") }}</span>
+          <strong>SQLite · Embed</strong>
         </div>
         <div class="signal-card warm">
-          <span>{{ app.t("activeShares") }}</span>
-          <strong>{{ app.formatNumber(app.state.shares.filter(item => item.enabled).length) }}</strong>
+          <span>{{ app.t("backupStatus") }}</span>
+          <strong>{{ app.state.backupPath ? app.t("backupReady") : app.t("noBackupYet") }}</strong>
         </div>
       </div>
     </article>
 
     <div class="panel-grid">
-      <article class="panel workspace-panel">
-        <div class="panel-head">
-          <div>
-            <h3>{{ app.t("snippetHub") }}</h3>
-            <p>{{ app.t("settingsText") }}</p>
-          </div>
-        </div>
-        <div class="settings-grid">
-          <div class="setting-card">
-            <span>{{ app.t("trackerSnippet") }}</span>
-            <pre>{{ app.trackerSnippet }}</pre>
-          </div>
-          <div class="setting-card">
-            <span>{{ app.t("status") }}</span>
-            <pre>{{ app.state.version || "0.1.0" }} · SQLite · Embed</pre>
-          </div>
-          <div class="setting-card">
-            <span>{{ app.t("pixelSnippet") }}</span>
-            <pre>{{ app.firstPixelSnippet }}</pre>
-          </div>
-          <div class="setting-card">
-            <span>{{ app.t("publicLink") }}</span>
-            <pre>{{ app.firstShareLink }}</pre>
-          </div>
-        </div>
-      </article>
+
 
       <article class="panel workspace-panel">
         <div class="panel-head">
@@ -122,7 +97,7 @@
           <button class="primary-button" @click="app.createBackup">{{ app.t("createBackupNow") }}</button>
           <div class="form-block">
             <strong>{{ app.t("latestBackupPath") }}</strong>
-            <pre>{{ app.state.backupPath || app.t("noData") }}</pre>
+            <pre>{{ app.state.backupPath || app.t("noBackupYet") }}</pre>
           </div>
         </div>
       </article>
@@ -142,17 +117,6 @@ const app = useAppController();
   gap: 1rem;
 }
 
-.workspace-panel {
-  display: grid;
-  gap: 1rem;
-  align-content: start;
-}
-
-.workspace-panel :deep(pre) {
-  white-space: pre-wrap;
-  word-break: break-all;
-}
-
 .compact-signal-grid {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
@@ -165,9 +129,26 @@ const app = useAppController();
   color: var(--accent-warm-deep);
 }
 
+.workspace-panel {
+  display: grid;
+  gap: 1rem;
+  align-content: start;
+}
+
+.workspace-panel :deep(pre) {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 .ops-stack {
   display: grid;
   gap: 1rem;
+}
+
+.helper-block p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.7;
 }
 
 @media (max-width: 980px) {
