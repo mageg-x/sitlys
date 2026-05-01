@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +39,9 @@ const (
 //go:embed embed/* embed/**/*
 var staticFiles embed.FS
 
+//go:embed tracker.js
+var trackerScript string
+
 type Config struct {
 	Addr        string
 	DataDir     string
@@ -46,15 +50,17 @@ type Config struct {
 }
 
 type App struct {
-	cfg        Config
-	db         *sql.DB
-	server     *http.Server
-	staticFS   fs.FS
-	staticHTTP http.Handler
-	eventQueue chan queuedEvent
-	workerCtx  context.Context
-	workerStop context.CancelFunc
-	workerWG   sync.WaitGroup
+	cfg         Config
+	db          *sql.DB
+	server      *http.Server
+	staticFS    fs.FS
+	staticHTTP  http.Handler
+	eventQueue  chan queuedEvent
+	workerCtx   context.Context
+	workerStop  context.CancelFunc
+	workerWG    sync.WaitGroup
+	rateMu      sync.Mutex
+	rateBuckets map[string]rateBucket
 }
 
 type AuthUser struct {
@@ -112,10 +118,17 @@ type Funnel struct {
 }
 
 type SystemSettings struct {
-	ListenAddr   string `json:"listen_addr"`
-	DatabasePath string `json:"database_path"`
-	LogLevel     string `json:"log_level"`
-	UpdatedAt    string `json:"updated_at"`
+	ListenAddr        string `json:"listen_addr"`
+	DatabasePath      string `json:"database_path"`
+	LogLevel          string `json:"log_level"`
+	DataRetentionDays int    `json:"data_retention_days"`
+	LastCleanupAt     string `json:"last_cleanup_at"`
+	UpdatedAt         string `json:"updated_at"`
+}
+
+type rateBucket struct {
+	Count   int
+	ResetAt time.Time
 }
 
 type eventRequest struct {
@@ -274,9 +287,10 @@ func New(cfg Config) (*App, error) {
 	}
 
 	app := &App{
-		cfg:        cfg,
-		db:         db,
-		eventQueue: make(chan queuedEvent, 8192),
+		cfg:         cfg,
+		db:          db,
+		eventQueue:  make(chan queuedEvent, 8192),
+		rateBuckets: make(map[string]rateBucket),
 	}
 	if err := app.initSchema(); err != nil {
 		db.Close()
@@ -383,7 +397,9 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("PUT /api/shares/", a.handleShareByID)
 
 	mux.HandleFunc("POST /api/send", a.handleSend)
+	mux.HandleFunc("OPTIONS /api/send", a.handleSend)
 	mux.HandleFunc("POST /api/batch", a.handleBatch)
+	mux.HandleFunc("OPTIONS /api/batch", a.handleBatch)
 
 	mux.HandleFunc("GET /api/settings", a.handleSettings)
 	mux.HandleFunc("PUT /api/settings", a.handleSettings)
@@ -399,8 +415,11 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("GET /api/analytics/retention", a.handleRetention)
 	mux.HandleFunc("GET /api/analytics/revenue", a.handleRevenue)
 	mux.HandleFunc("GET /api/analytics/funnel", a.handleFunnelReport)
+	mux.HandleFunc("GET /api/analytics/realtime", a.handleRealtime)
+	mux.HandleFunc("GET /api/analytics/export", a.handleExport)
 
 	mux.HandleFunc("GET /api/public/shares/", a.handlePublicShare)
+	mux.HandleFunc("POST /api/settings/cleanup", a.handleCleanup)
 	mux.HandleFunc("/", a.handleApp)
 	return withLogging(mux)
 }
@@ -710,13 +729,18 @@ func (a *App) hasUsers() (bool, error) {
 	return count > 0, nil
 }
 
-func (a *App) setSessionCookie(w http.ResponseWriter, token string, expires time.Time) {
+func (a *App) setSessionCookie(w http.ResponseWriter, r *http.Request, token string, expires time.Time) {
+	secure := false
+	if r != nil {
+		secure = r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
+		Secure:   secure,
 		Expires:  expires,
 	})
 }
@@ -733,6 +757,9 @@ func (a *App) clearSessionCookie(w http.ResponseWriter) {
 }
 
 func (a *App) createSession(userID string) (string, time.Time, error) {
+	if err := a.cleanupExpiredSessions(); err != nil {
+		return "", time.Time{}, err
+	}
 	token := newID() + newID()
 	expires := nowUTC().Add(time.Duration(a.cfg.SessionDays) * 24 * time.Hour)
 	_, err := a.db.Exec(`
@@ -740,6 +767,11 @@ func (a *App) createSession(userID string) (string, time.Time, error) {
 		values(?, ?, ?, ?, ?)
 	`, newID(), userID, tokenHash(token), iso(expires), iso(nowUTC()))
 	return token, expires, err
+}
+
+func (a *App) cleanupExpiredSessions() error {
+	_, err := a.db.Exec(`delete from auth_sessions where expires_at < ?`, iso(nowUTC()))
+	return err
 }
 
 func (a *App) currentUser(r *http.Request) (*AuthUser, error) {
@@ -886,20 +918,20 @@ func parseDateInput(value string) (time.Time, error) {
 	return time.Parse(time.RFC3339, value)
 }
 
-func cleanURL(raw string) (fullURL, host, path, refDomain string) {
+func cleanURL(raw string) (fullURL, host, path string) {
 	if raw == "" {
-		return "", "", "", ""
+		return "", "", ""
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		return raw, "", "", ""
+		return raw, "", ""
 	}
 	host = strings.ToLower(parsed.Hostname())
 	path = parsed.EscapedPath()
 	if path == "" {
 		path = "/"
 	}
-	return raw, host, path, ""
+	return raw, host, path
 }
 
 func referrerDomain(raw string) string {
@@ -936,7 +968,7 @@ func normalizeEventType(payload eventPayload, pixelID string) string {
 		return "revenue"
 	}
 	if payload.Name != "" {
-		return "custom"
+		return "event"
 	}
 	if pixelID != "" {
 		return "pixel"
@@ -964,26 +996,116 @@ func detectUserAgent(r *http.Request, payload eventPayload) (browser, osName, de
 	switch {
 	case strings.Contains(ua, "windows"):
 		osName = "Windows"
-	case strings.Contains(ua, "mac os"):
-		osName = "macOS"
-	case strings.Contains(ua, "linux"):
-		osName = "Linux"
 	case strings.Contains(ua, "android"):
 		osName = "Android"
+	case strings.Contains(ua, "mac os"):
+		osName = "macOS"
 	case strings.Contains(ua, "iphone"), strings.Contains(ua, "ipad"):
 		osName = "iOS"
+	case strings.Contains(ua, "linux"):
+		osName = "Linux"
 	default:
 		osName = "Unknown"
 	}
 	switch {
-	case strings.Contains(ua, "mobile"), strings.Contains(ua, "iphone"), strings.Contains(ua, "android"):
-		device = "mobile"
 	case strings.Contains(ua, "ipad"), strings.Contains(ua, "tablet"):
 		device = "tablet"
+	case strings.Contains(ua, "android") && !strings.Contains(ua, "mobile"):
+		device = "tablet"
+	case strings.Contains(ua, "mobile"), strings.Contains(ua, "iphone"), strings.Contains(ua, "android"):
+		device = "mobile"
 	default:
 		device = "desktop"
 	}
 	return
+}
+
+func isBotTraffic(userAgent string) bool {
+	ua := strings.ToLower(strings.TrimSpace(userAgent))
+	if ua == "" {
+		return false
+	}
+	for _, token := range []string{
+		"bot",
+		"spider",
+		"crawler",
+		"headless",
+		"preview",
+		"slurp",
+		"bingpreview",
+		"facebookexternalhit",
+		"curl",
+		"wget",
+		"httpclient",
+		"ahrefs",
+		"semrush",
+		"bytespider",
+		"applebot",
+		"discordbot",
+		"telegrambot",
+		"whatsapp",
+		"slackbot",
+		"python-requests",
+		"go-http-client",
+	} {
+		if strings.Contains(ua, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func isBotRequest(r *http.Request) bool {
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("Purpose")), "prefetch") {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Purpose")), "prefetch") {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Moz")), "prefetch") {
+		return true
+	}
+	return false
+}
+
+func detectGeo(r *http.Request, payload eventPayload) (country, region, city string) {
+	country = strings.TrimSpace(firstNonEmpty(
+		payload.Country,
+		r.Header.Get("CF-IPCountry"),
+		r.Header.Get("X-Appengine-Country"),
+		r.Header.Get("X-Country-Code"),
+	))
+	region = strings.TrimSpace(firstNonEmpty(
+		payload.Region,
+		r.Header.Get("X-Appengine-Region"),
+		r.Header.Get("CF-Region-Code"),
+		r.Header.Get("X-Region-Code"),
+	))
+	city = strings.TrimSpace(firstNonEmpty(
+		payload.City,
+		r.Header.Get("X-Appengine-City"),
+		r.Header.Get("CF-IPCity"),
+		r.Header.Get("X-City"),
+	))
+	return
+}
+
+func (a *App) allowCollectionRequest(r *http.Request, websiteID string, cost int) bool {
+	ip := clientIP(r)
+	userAgent := strings.TrimSpace(r.UserAgent())
+	websiteKey := "collection:website:" + websiteID
+	ipKey := "collection:ip:" + ip
+	clientKey := "collection:client:" + websiteID + ":" + ip + ":" + tokenHash(userAgent)[:16]
+	if !a.allowRateLimit(websiteKey, 1200, cost, time.Minute) {
+		return false
+	}
+	if !a.allowRateLimit(ipKey, 240, cost, time.Minute) {
+		return false
+	}
+	if !a.allowRateLimit(clientKey, 120, cost, time.Minute) {
+		return false
+	}
+	return true
 }
 
 func isValidRole(role string) bool {
@@ -1004,9 +1126,10 @@ func boolInt(value bool) int {
 
 func (a *App) getSystemSettings() (SystemSettings, error) {
 	settings := SystemSettings{
-		ListenAddr:   a.cfg.Addr,
-		DatabasePath: a.cfg.DBPath,
-		LogLevel:     "info",
+		ListenAddr:        a.cfg.Addr,
+		DatabasePath:      a.cfg.DBPath,
+		LogLevel:          "info",
+		DataRetentionDays: 365,
 	}
 	rows, err := a.db.Query(`
 		select key, value, updated_at
@@ -1029,6 +1152,12 @@ func (a *App) getSystemSettings() (SystemSettings, error) {
 			settings.DatabasePath = value
 		case "log_level":
 			settings.LogLevel = value
+		case "data_retention_days":
+			if days, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && days > 0 {
+				settings.DataRetentionDays = days
+			}
+		case "last_cleanup_at":
+			settings.LastCleanupAt = value
 		}
 		if updatedAt > settings.UpdatedAt {
 			settings.UpdatedAt = updatedAt
@@ -1075,4 +1204,115 @@ func (a *App) createBackup() (string, error) {
 		return "", err
 	}
 	return targetPath, nil
+}
+
+func (a *App) allowRateLimit(key string, limit, cost int, window time.Duration) bool {
+	if key == "" {
+		return true
+	}
+	if cost <= 0 {
+		cost = 1
+	}
+	now := nowUTC()
+
+	a.rateMu.Lock()
+	defer a.rateMu.Unlock()
+
+	for itemKey, bucket := range a.rateBuckets {
+		if now.After(bucket.ResetAt) {
+			delete(a.rateBuckets, itemKey)
+		}
+	}
+
+	bucket, ok := a.rateBuckets[key]
+	if !ok || now.After(bucket.ResetAt) {
+		bucket = rateBucket{ResetAt: now.Add(window)}
+	}
+	if bucket.Count+cost > limit {
+		a.rateBuckets[key] = bucket
+		return false
+	}
+	bucket.Count += cost
+	a.rateBuckets[key] = bucket
+	return true
+}
+
+func (a *App) cleanupHistoricalData(retentionDays int) (map[string]any, error) {
+	if retentionDays <= 0 {
+		retentionDays = 365
+	}
+	cutoff := nowUTC().AddDate(0, 0, -retentionDays)
+	cutoffDate := cutoff.Format("2006-01-02")
+	tx, err := a.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	result := map[string]any{
+		"retention_days": retentionDays,
+		"cutoff_at":      iso(cutoff),
+	}
+
+	collectDelete := func(key, query string, args ...any) error {
+		res, err := tx.Exec(query, args...)
+		if err != nil {
+			return err
+		}
+		count, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		result[key] = count
+		return nil
+	}
+
+	if err := collectDelete("deleted_events", `delete from events where created_at < ?`, iso(cutoff)); err != nil {
+		return nil, err
+	}
+	if err := collectDelete("deleted_sessions", `delete from sessions where last_seen_at < ?`, iso(cutoff)); err != nil {
+		return nil, err
+	}
+	if err := collectDelete("deleted_visitors", `delete from visitors where last_seen_at < ? and not exists (select 1 from sessions where sessions.visitor_id = visitors.id)`, iso(cutoff)); err != nil {
+		return nil, err
+	}
+
+	aggregateTables := []string{
+		"agg_overview_daily",
+		"agg_pages_daily",
+		"agg_referrers_daily",
+		"agg_devices_daily",
+		"agg_geo_daily",
+		"agg_attribution_daily",
+		"agg_revenue_daily",
+	}
+	var aggregateRows int64
+	for _, table := range aggregateTables {
+		res, err := tx.Exec(`delete from `+table+` where bucket_date < ?`, cutoffDate)
+		if err != nil {
+			return nil, err
+		}
+		count, err := res.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		aggregateRows += count
+	}
+	result["deleted_aggregate_rows"] = aggregateRows
+
+	cleanupAt := iso(nowUTC())
+	if _, err := tx.Exec(`
+		insert into system_settings(key, value, updated_at)
+		values('last_cleanup_at', ?, ?)
+		on conflict(key) do update set
+			value = excluded.value,
+			updated_at = excluded.updated_at
+	`, cleanupAt, cleanupAt); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	result["last_cleanup_at"] = cleanupAt
+	return result, nil
 }

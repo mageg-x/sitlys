@@ -19,6 +19,7 @@ export function createRouteActions(ctx) {
 
   async function applyRange() {
     await refreshActive();
+    await ctx.loadRealtime();
   }
 
   async function selectRoute(route) {
@@ -65,6 +66,7 @@ export function createRouteActions(ctx) {
       state.websiteId = state.websites[0].id;
     }
     await refreshActive();
+    await ctx.loadRealtime();
     if (isSuperAdmin.value) {
       await ctx.loadUsers();
       await ctx.loadSettings();

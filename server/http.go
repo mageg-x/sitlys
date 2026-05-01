@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"net/url"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -66,9 +69,10 @@ type funnelInput struct {
 }
 
 type settingsInput struct {
-	ListenAddr   string `json:"listen_addr"`
-	DatabasePath string `json:"database_path"`
-	LogLevel     string `json:"log_level"`
+	ListenAddr        string `json:"listen_addr"`
+	DatabasePath      string `json:"database_path"`
+	LogLevel          string `json:"log_level"`
+	DataRetentionDays int    `json:"data_retention_days"`
 }
 
 func (a *App) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -79,66 +83,15 @@ func (a *App) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (a *App) handleTracker(w http.ResponseWriter, r *http.Request) {
-	script := `(function () {
-  var script = document.currentScript;
-  if (!script) return;
-  var website = script.getAttribute("data-website-id");
-  if (!website) return;
-  var origin = new URL(script.src, window.location.href).origin;
-  var storageKey = "sitlys.visitor." + website;
-  var visitorId = localStorage.getItem(storageKey);
-  if (!visitorId) {
-    visitorId = (crypto && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(16).slice(2) + Date.now().toString(16)).replace(/-/g, "");
-    localStorage.setItem(storageKey, visitorId);
-  }
-
-  function collect(type, payload) {
-    var body = JSON.stringify({ type: type, payload: payload });
-    if (navigator.sendBeacon) {
-      var blob = new Blob([body], { type: "application/json" });
-      navigator.sendBeacon(origin + "/api/send", blob);
-      return;
-    }
-    fetch(origin + "/api/send", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: body,
-      keepalive: true
-    }).catch(function () {});
-  }
-
-  function basePayload(extra) {
-    var payload = {
-      website: website,
-      url: window.location.href,
-      hostname: window.location.hostname,
-      title: document.title,
-      referrer: document.referrer || "",
-      language: navigator.language || "",
-      screen: window.screen ? window.screen.width + "x" + window.screen.height : "",
-      id: visitorId,
-      timestamp: Date.now()
-    };
-    return Object.assign(payload, extra || {});
-  }
-
-  window.sitlys = {
-    track: function (name, data) {
-      collect("event", basePayload({ name: name, data: data || {} }));
-    },
-    revenue: function (name, amount, currency, data) {
-      collect("revenue", basePayload({
-        name: name,
-        data: data || {},
-        revenue: { amount: Number(amount || 0), currency: currency || "USD" }
-      }));
-    }
-  };
-
-  collect("event", basePayload());
-})();`
 	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-	http.ServeContent(w, r, "tracker.js", nowUTC(), strings.NewReader(script))
+	http.ServeContent(w, r, "tracker.js", nowUTC(), strings.NewReader(trackerScript))
+}
+
+func setCollectionCORS(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Max-Age", "86400")
 }
 
 func (a *App) handleApp(w http.ResponseWriter, r *http.Request) {
@@ -230,7 +183,7 @@ func (a *App) handleInit(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusInternalServerError, "create session failed")
 		return
 	}
-	a.setSessionCookie(w, token, expires)
+	a.setSessionCookie(w, r, token, expires)
 	jsonResponse(w, http.StatusCreated, map[string]any{"ok": true})
 }
 
@@ -262,7 +215,7 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusInternalServerError, "create session failed")
 		return
 	}
-	a.setSessionCookie(w, token, expires)
+	a.setSessionCookie(w, r, token, expires)
 	jsonResponse(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -448,6 +401,37 @@ func (a *App) handleUserByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
+
+	var currentRole string
+	var currentEnabled int
+	if err := tx.QueryRow(`select role, enabled from users where id = ?`, userID).Scan(&currentRole, &currentEnabled); err != nil {
+		errorResponse(w, http.StatusNotFound, "user not found")
+		return
+	}
+
+	nextRole := currentRole
+	if req.Role != "" {
+		nextRole = req.Role
+	}
+	nextEnabled := currentEnabled == 1
+	if req.Enabled != nil {
+		nextEnabled = *req.Enabled
+	}
+	if user.ID == userID && (nextRole != roleSuperAdmin || !nextEnabled) {
+		errorResponse(w, http.StatusBadRequest, "cannot remove your own super admin access")
+		return
+	}
+	if currentRole == roleSuperAdmin && (nextRole != roleSuperAdmin || !nextEnabled) {
+		var enabledSuperAdmins int
+		if err := tx.QueryRow(`select count(*) from users where role = ? and enabled = 1`, roleSuperAdmin).Scan(&enabledSuperAdmins); err != nil {
+			errorResponse(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if enabledSuperAdmins <= 1 {
+			errorResponse(w, http.StatusBadRequest, "at least one enabled super admin is required")
+			return
+		}
+	}
 
 	var parts []string
 	var args []any
@@ -923,19 +907,32 @@ func (a *App) handleCollectPixel(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	var pixelID string
+	setCollectionCORS(w)
+	var pixelID, websiteID string
 	var enabled int
-	err := a.db.QueryRow(`select id, enabled from pixels where slug = ?`, slug).Scan(&pixelID, &enabled)
+	err := a.db.QueryRow(`select id, website_id, enabled from pixels where slug = ?`, slug).Scan(&pixelID, &websiteID, &enabled)
 	if err != nil || enabled != 1 {
 		http.NotFound(w, r)
 		return
 	}
+	if !a.allowCollectionRequest(r, websiteID, 1) {
+		w.Header().Set("Content-Type", "image/gif")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write(onePixelGIF)
+		return
+	}
+	query := r.URL.Query()
+	pixelURL := firstNonEmpty(strings.TrimSpace(query.Get("url")), r.Referer(), r.URL.String())
+	visitorID := firstNonEmpty(strings.TrimSpace(query.Get("id")), strings.TrimSpace(query.Get("vid")))
 	req := eventRequest{
 		Type: "event",
 		Payload: eventPayload{
+			Website:  websiteID,
 			Pixel:    pixelID,
-			URL:      r.URL.String(),
-			Referrer: r.Referer(),
+			URL:      pixelURL,
+			Referrer: firstNonEmpty(strings.TrimSpace(query.Get("referrer")), r.Referer()),
+			ID:       visitorID,
 		},
 	}
 	if _, err := a.recordEvent(r, req); err != nil {
@@ -948,9 +945,19 @@ func (a *App) handleCollectPixel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleSend(w http.ResponseWriter, r *http.Request) {
+	setCollectionCORS(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	var req eventRequest
 	if err := decodeJSON(r, &req); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	websiteID := strings.TrimSpace(firstNonEmpty(req.Payload.Website, a.websiteForPixel(strings.TrimSpace(req.Payload.Pixel))))
+	if websiteID != "" && !a.allowCollectionRequest(r, websiteID, 1) {
+		errorResponse(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	}
 	result, err := a.recordEvent(r, req)
@@ -962,9 +969,25 @@ func (a *App) handleSend(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleBatch(w http.ResponseWriter, r *http.Request) {
+	setCollectionCORS(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	var reqs []eventRequest
 	if err := decodeJSON(r, &reqs); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	websiteID := ""
+	for _, req := range reqs {
+		websiteID = strings.TrimSpace(firstNonEmpty(req.Payload.Website, a.websiteForPixel(strings.TrimSpace(req.Payload.Pixel))))
+		if websiteID != "" {
+			break
+		}
+	}
+	if websiteID != "" && !a.allowCollectionRequest(r, websiteID, len(reqs)) {
+		errorResponse(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	}
 	results := make([]map[string]any, 0, len(reqs))
@@ -1018,10 +1041,18 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if req.LogLevel == "" {
 			req.LogLevel = "info"
 		}
+		retentionDays := req.DataRetentionDays
+		if retentionDays <= 0 {
+			retentionDays = 365
+			if current, err := a.getSystemSettings(); err == nil && current.DataRetentionDays > 0 {
+				retentionDays = current.DataRetentionDays
+			}
+		}
 		if err := a.setSystemSettings(map[string]string{
-			"listen_addr":   req.ListenAddr,
-			"database_path": req.DatabasePath,
-			"log_level":     req.LogLevel,
+			"listen_addr":         req.ListenAddr,
+			"database_path":       req.DatabasePath,
+			"log_level":           req.LogLevel,
+			"data_retention_days": strconv.Itoa(retentionDays),
 		}); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "save settings failed")
 			return
@@ -1030,6 +1061,28 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (a *App) handleCleanup(w http.ResponseWriter, r *http.Request) {
+	user, ok := a.requireUser(w, r)
+	if !ok {
+		return
+	}
+	if user.Role != roleSuperAdmin {
+		errorResponse(w, http.StatusForbidden, "super admin required")
+		return
+	}
+	settings, err := a.getSystemSettings()
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	result, err := a.cleanupHistoricalData(settings.DataRetentionDays)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "cleanup failed")
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"ok": true, "result": result})
 }
 
 func (a *App) handleBackup(w http.ResponseWriter, r *http.Request) {
@@ -1099,9 +1152,17 @@ func (a *App) recordEvent(r *http.Request, req eventRequest) (map[string]any, er
 	if !strings.Contains(fullURL, "://") && fullURL != "" {
 		fullURL = "https://" + strings.TrimPrefix(fullURL, "/")
 	}
-	parsedURL, host, pathValue, _ := cleanURL(fullURL)
+	parsedURL, host, pathValue := cleanURL(fullURL)
 	refDomain := referrerDomain(payload.Referrer)
 	browser, osName, device := detectUserAgent(r, payload)
+	country, region, city := detectGeo(r, payload)
+	if isBotTraffic(r.UserAgent()) || isBotRequest(r) {
+		return map[string]any{
+			"website_id": websiteID,
+			"ignored":    true,
+			"reason":     "bot",
+		}, nil
+	}
 	if payload.Hostname != "" {
 		host = payload.Hostname
 	}
@@ -1142,9 +1203,9 @@ func (a *App) recordEvent(r *http.Request, req eventRequest) (map[string]any, er
 		Browser:        browser,
 		OS:             osName,
 		Device:         device,
-		Country:        payload.Country,
-		Region:         payload.Region,
-		City:           payload.City,
+		Country:        country,
+		Region:         region,
+		City:           city,
 		Amount:         amount,
 		Currency:       currency,
 		Metadata:       string(metadata),
@@ -1154,7 +1215,14 @@ func (a *App) recordEvent(r *http.Request, req eventRequest) (map[string]any, er
 	select {
 	case a.eventQueue <- item:
 	default:
-		return nil, fmt.Errorf("event queue is full")
+		if err := a.writeEventImmediately(item); err != nil {
+			return nil, fmt.Errorf("event queue is full")
+		}
+		return map[string]any{
+			"website_id": websiteID,
+			"event_type": eventType,
+			"queued":     false,
+		}, nil
 	}
 
 	return map[string]any{
@@ -1170,6 +1238,17 @@ func (a *App) websiteExists(websiteID string) bool {
 		return false
 	}
 	return count > 0
+}
+
+func (a *App) websiteForPixel(pixelID string) string {
+	if pixelID == "" {
+		return ""
+	}
+	var websiteID string
+	if err := a.db.QueryRow(`select website_id from pixels where id = ?`, pixelID).Scan(&websiteID); err != nil {
+		return ""
+	}
+	return websiteID
 }
 
 func (a *App) upsertVisitor(websiteID, externalID string, seenAt time.Time) (string, error) {
@@ -1360,12 +1439,38 @@ func (a *App) handleOverview(w http.ResponseWriter, r *http.Request) {
 			"revenue":   revenue,
 		})
 	}
-	jsonResponse(w, http.StatusOK, map[string]any{"ok": true, "overview": out, "trend": trend})
+	compare, _ := a.loadOverviewCompare(websiteID, from, to)
+	jsonResponse(w, http.StatusOK, map[string]any{"ok": true, "overview": out, "trend": trend, "compare": compare})
 }
 
 func (a *App) handlePages(w http.ResponseWriter, r *http.Request) {
 	user, websiteID, from, to, ok := a.analyticsContext(w, r)
 	if !ok || !a.requireWebsiteView(w, user, websiteID) {
+		return
+	}
+	sessionRows, err := a.db.Query(`
+		select url_path, count(distinct session_id) as sessions
+		from events
+		where website_id = ? and event_type = 'pageview' and created_at between ? and ?
+		group by url_path
+	`, websiteID, iso(from), iso(to))
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	sessionCounts := map[string]int64{}
+	for sessionRows.Next() {
+		var path string
+		var sessions int64
+		if err := sessionRows.Scan(&path, &sessions); err != nil {
+			sessionRows.Close()
+			errorResponse(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		sessionCounts[path] = sessions
+	}
+	if err := sessionRows.Close(); err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	rows, err := a.db.Query(`
@@ -1389,16 +1494,10 @@ func (a *App) handlePages(w http.ResponseWriter, r *http.Request) {
 			errorResponse(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		var sessions int64
-		_ = a.db.QueryRow(`
-			select count(distinct session_id)
-			from events
-			where website_id = ? and url_path = ? and event_type = 'pageview' and created_at between ? and ?
-		`, websiteID, path, iso(from), iso(to)).Scan(&sessions)
 		items = append(items, map[string]any{
 			"path":      path,
 			"pageviews": pageviews,
-			"sessions":  sessions,
+			"sessions":  sessionCounts[path],
 		})
 	}
 	entryRows, err := a.db.Query(`
@@ -1811,11 +1910,20 @@ func (a *App) handleRetention(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows, err := a.db.Query(`
-		select visitor_id, date(started_at)
-		from sessions
-		where website_id = ?
-		order by visitor_id asc, started_at asc
-	`, websiteID)
+		with cohort_visitors as (
+			select visitor_id, min(date(started_at)) as cohort_day
+			from sessions
+			where website_id = ?
+			group by visitor_id
+			having cohort_day between ? and ?
+		)
+		select s.visitor_id, date(s.started_at), c.cohort_day
+		from sessions s
+		join cohort_visitors c on c.visitor_id = s.visitor_id
+		where s.website_id = ?
+			and date(s.started_at) between c.cohort_day and date(c.cohort_day, '+30 day')
+		order by s.visitor_id asc, s.started_at asc
+	`, websiteID, from.Format("2006-01-02"), to.Format("2006-01-02"), websiteID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1832,23 +1940,19 @@ func (a *App) handleRetention(w http.ResponseWriter, r *http.Request) {
 	seen := map[string][]time.Time{}
 	first := map[string]time.Time{}
 	for rows.Next() {
-		var visitorID, dayText string
-		if err := rows.Scan(&visitorID, &dayText); err != nil {
+		var visitorID, dayText, cohortText string
+		if err := rows.Scan(&visitorID, &dayText, &cohortText); err != nil {
 			errorResponse(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		day, _ := time.ParseInLocation("2006-01-02", dayText, time.UTC)
-		if _, ok := first[visitorID]; !ok {
-			first[visitorID] = day
-		}
+		cohortDay, _ := time.ParseInLocation("2006-01-02", cohortText, time.UTC)
+		first[visitorID] = cohortDay
 		seen[visitorID] = append(seen[visitorID], day)
 	}
 
 	for visitorID, days := range seen {
 		cohortDay := first[visitorID]
-		if cohortDay.Before(from.Truncate(24*time.Hour)) || cohortDay.After(to) {
-			continue
-		}
 		key := cohortDay.Format("2006-01-02")
 		if cohorts[key] == nil {
 			cohorts[key] = &retentionData{}
@@ -1918,6 +2022,245 @@ func (a *App) handleFunnelReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{"ok": true, "funnel": funnel, "report": report})
+}
+
+func (a *App) handleRealtime(w http.ResponseWriter, r *http.Request) {
+	user, websiteID, _, _, ok := a.analyticsContext(w, r)
+	if !ok || !a.requireWebsiteView(w, user, websiteID) {
+		return
+	}
+	since := nowUTC().Add(-5 * time.Minute)
+	var activeVisitors, activeSessions int64
+	if err := a.db.QueryRow(`
+		select count(distinct visitor_id), count(*)
+		from sessions
+		where website_id = ? and last_seen_at >= ?
+	`, websiteID, iso(since)).Scan(&activeVisitors, &activeSessions); err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	rows, err := a.db.Query(`
+		select strftime('%Y-%m-%dT%H:%M:00Z', created_at) as bucket, count(*) as events
+		from events
+		where website_id = ? and created_at >= ?
+		group by bucket
+		order by bucket asc
+	`, websiteID, iso(since))
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+	var timeline []map[string]any
+	for rows.Next() {
+		var bucket string
+		var events int64
+		if err := rows.Scan(&bucket, &events); err != nil {
+			errorResponse(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		timeline = append(timeline, map[string]any{"bucket": bucket, "events": events})
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"ok": true,
+		"realtime": map[string]any{
+			"window_minutes":   5,
+			"active_visitors":  activeVisitors,
+			"active_sessions":  activeSessions,
+			"event_timeline":   timeline,
+			"generated_at_utc": iso(nowUTC()),
+		},
+	})
+}
+
+func (a *App) handleExport(w http.ResponseWriter, r *http.Request) {
+	user, websiteID, from, to, ok := a.analyticsContext(w, r)
+	if !ok || !a.requireWebsiteView(w, user, websiteID) {
+		return
+	}
+	kind := strings.TrimSpace(r.URL.Query().Get("kind"))
+	if kind == "" {
+		kind = "events"
+	}
+	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
+	if format == "" {
+		format = "csv"
+	}
+	switch kind {
+	case "events":
+		a.exportEvents(w, r, websiteID, from, to, format)
+	case "sessions":
+		a.exportSessions(w, r, websiteID, from, to, format)
+	default:
+		errorResponse(w, http.StatusBadRequest, "unsupported export kind")
+	}
+}
+
+func (a *App) exportEvents(w http.ResponseWriter, _ *http.Request, websiteID string, from, to time.Time, format string) {
+	rows, err := a.db.Query(`
+		select created_at, event_type, event_name, url_path, referrer_domain, browser, os, device, country, region, city, amount, currency
+		from events
+		where website_id = ? and created_at between ? and ?
+		order by created_at asc
+		limit 20000
+	`, websiteID, iso(from), iso(to))
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
+	headers := []string{"created_at", "event_type", "event_name", "url_path", "referrer_domain", "browser", "os", "device", "country", "region", "city", "amount", "currency"}
+	var records [][]string
+	for rows.Next() {
+		var createdAt, eventType, eventName, urlPath, referrer, browser, osName, device, country, region, city, currency string
+		var amount float64
+		if err := rows.Scan(&createdAt, &eventType, &eventName, &urlPath, &referrer, &browser, &osName, &device, &country, &region, &city, &amount, &currency); err != nil {
+			errorResponse(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		records = append(records, []string{
+			createdAt, eventType, eventName, urlPath, referrer, browser, osName, device, country, region, city, fmt.Sprintf("%.2f", amount), currency,
+		})
+	}
+	writeExport(w, format, "events", headers, records)
+}
+
+func (a *App) exportSessions(w http.ResponseWriter, _ *http.Request, websiteID string, from, to time.Time, format string) {
+	rows, err := a.db.Query(`
+		select started_at, last_seen_at, event_count, pageviews, referrer_domain, utm_source, utm_medium, utm_campaign, browser, os, device, country, region, city, entry_path, exit_path
+		from sessions
+		where website_id = ? and started_at between ? and ?
+		order by started_at asc
+		limit 20000
+	`, websiteID, iso(from), iso(to))
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
+	headers := []string{"started_at", "last_seen_at", "event_count", "pageviews", "referrer_domain", "utm_source", "utm_medium", "utm_campaign", "browser", "os", "device", "country", "region", "city", "entry_path", "exit_path"}
+	var records [][]string
+	for rows.Next() {
+		var startedAt, lastSeenAt, referrer, utmSource, utmMedium, utmCampaign, browser, osName, device, country, region, city, entryPath, exitPath string
+		var eventCount, pageviews int
+		if err := rows.Scan(&startedAt, &lastSeenAt, &eventCount, &pageviews, &referrer, &utmSource, &utmMedium, &utmCampaign, &browser, &osName, &device, &country, &region, &city, &entryPath, &exitPath); err != nil {
+			errorResponse(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		records = append(records, []string{
+			startedAt, lastSeenAt, strconv.Itoa(eventCount), strconv.Itoa(pageviews), referrer, utmSource, utmMedium, utmCampaign, browser, osName, device, country, region, city, entryPath, exitPath,
+		})
+	}
+	writeExport(w, format, "sessions", headers, records)
+}
+
+func writeExport(w http.ResponseWriter, format, name string, headers []string, records [][]string) {
+	if format == "json" {
+		items := make([]map[string]string, 0, len(records))
+		for _, record := range records {
+			item := make(map[string]string, len(headers))
+			for index, header := range headers {
+				if index < len(record) {
+					item[header] = record[index]
+				}
+			}
+			items = append(items, item)
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.json"`, name))
+		jsonResponse(w, http.StatusOK, map[string]any{"ok": true, "items": items})
+		return
+	}
+
+	var buffer bytes.Buffer
+	writer := csv.NewWriter(&buffer)
+	_ = writer.Write(headers)
+	for _, record := range records {
+		_ = writer.Write(record)
+	}
+	writer.Flush()
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.csv"`, name))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(buffer.Bytes())
+}
+
+func (a *App) loadOverviewCompare(websiteID string, from, to time.Time) (map[string]any, error) {
+	duration := to.Sub(from)
+	if duration < 0 {
+		return nil, nil
+	}
+	prevTo := from.Add(-time.Second)
+	prevFrom := prevTo.Add(-duration)
+
+	type overview struct {
+		Pageviews int64
+		Visitors  int64
+		Sessions  int64
+		Events    int64
+		Revenue   float64
+	}
+	var current, previous overview
+	if err := a.db.QueryRow(`
+		select coalesce(sum(pageviews), 0), coalesce(sum(custom_events), 0), coalesce(sum(revenue), 0)
+		from agg_overview_daily
+		where website_id = ? and bucket_date between ? and ?
+	`, websiteID, from.Format("2006-01-02"), to.Format("2006-01-02")).Scan(&current.Pageviews, &current.Events, &current.Revenue); err != nil {
+		return nil, err
+	}
+	if err := a.db.QueryRow(`
+		select count(distinct visitor_id), count(*)
+		from sessions
+		where website_id = ? and started_at between ? and ?
+	`, websiteID, iso(from), iso(to)).Scan(&current.Visitors, &current.Sessions); err != nil {
+		return nil, err
+	}
+	if err := a.db.QueryRow(`
+		select coalesce(sum(pageviews), 0), coalesce(sum(custom_events), 0), coalesce(sum(revenue), 0)
+		from agg_overview_daily
+		where website_id = ? and bucket_date between ? and ?
+	`, websiteID, prevFrom.Format("2006-01-02"), prevTo.Format("2006-01-02")).Scan(&previous.Pageviews, &previous.Events, &previous.Revenue); err != nil {
+		return nil, err
+	}
+	if err := a.db.QueryRow(`
+		select count(distinct visitor_id), count(*)
+		from sessions
+		where website_id = ? and started_at between ? and ?
+	`, websiteID, iso(prevFrom), iso(prevTo)).Scan(&previous.Visitors, &previous.Sessions); err != nil {
+		return nil, err
+	}
+
+	return map[string]any{
+		"from": iso(prevFrom),
+		"to":   iso(prevTo),
+		"metrics": map[string]any{
+			"pageviews": metricDelta(current.Pageviews, previous.Pageviews),
+			"visitors":  metricDelta(current.Visitors, previous.Visitors),
+			"sessions":  metricDelta(current.Sessions, previous.Sessions),
+			"events":    metricDelta(current.Events, previous.Events),
+			"revenue":   metricDeltaFloat(current.Revenue, previous.Revenue),
+		},
+	}, nil
+}
+
+func metricDelta(current, previous int64) map[string]any {
+	change := current - previous
+	changeRate := 0.0
+	if previous > 0 {
+		changeRate = float64(change) / float64(previous)
+	}
+	return map[string]any{"current": current, "previous": previous, "change": change, "change_rate": changeRate}
+}
+
+func metricDeltaFloat(current, previous float64) map[string]any {
+	change := current - previous
+	changeRate := 0.0
+	if previous > 0 {
+		changeRate = change / previous
+	}
+	return map[string]any{"current": current, "previous": previous, "change": change, "change_rate": changeRate}
 }
 
 func (a *App) listFunnels(websiteID string) ([]Funnel, error) {

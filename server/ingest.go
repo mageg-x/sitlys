@@ -73,6 +73,10 @@ func (a *App) flushEventBatch(batch []queuedEvent) error {
 	return tx.Commit()
 }
 
+func (a *App) writeEventImmediately(item queuedEvent) error {
+	return a.flushEventBatch([]queuedEvent{item})
+}
+
 func (a *App) applyQueuedEvent(tx *sql.Tx, item queuedEvent) error {
 	visitorID, isNewVisitor, err := a.upsertVisitorTx(tx, item.WebsiteID, item.VisitorKey, item.CreatedAt)
 	if err != nil {
@@ -246,7 +250,7 @@ func (a *App) updateAggregatesTx(tx *sql.Tx, record eventRecord, session session
 
 	pageviews := 0
 	customEvents := 0
-	if record.EventType == "pageview" || record.EventType == "pixel" {
+	if record.EventType == "pageview" {
 		pageviews = 1
 	} else {
 		customEvents = 1

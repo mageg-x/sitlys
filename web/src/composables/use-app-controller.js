@@ -39,6 +39,7 @@ export function createAppController({ t, localeRef }) {
     websites: [],
     websiteId: "",
     overview: { pageviews: 0, visitors: 0, sessions: 0, events: 0, revenue: 0 },
+    overviewCompare: null,
     overviewTrend: [],
     pages: [],
     pageEntries: [],
@@ -62,6 +63,8 @@ export function createAppController({ t, localeRef }) {
     publicShare: null,
     settings: null,
     backupPath: "",
+    cleanupResult: null,
+    realtime: null,
   });
 
   const initForm = reactive({ username: "", password: "", confirmPassword: "" });
@@ -89,6 +92,7 @@ export function createAppController({ t, localeRef }) {
     listen_addr: "",
     database_path: "",
     log_level: "info",
+    data_retention_days: 365,
   });
   const pageFilter = reactive({ query: "" });
   const eventFilter = reactive({ query: "" });
@@ -161,12 +165,34 @@ export function createAppController({ t, localeRef }) {
   });
 
   const overviewCards = computed(() => [
-    { key: "pageviews", label: t("pageviews"), value: formatNumber(state.overview.pageviews) },
-    { key: "visitors", label: t("visitors"), value: formatNumber(state.overview.visitors) },
-    { key: "sessions", label: t("sessions"), value: formatNumber(state.overview.sessions) },
-    { key: "events", label: t("totalEvents"), value: formatNumber(state.overview.events) },
-    { key: "revenue", label: t("revenueTotal"), value: formatMoney(state.overview.revenue) },
+    { key: "pageviews", label: t("pageviews"), value: formatNumber(state.overview.pageviews), compare: state.overviewCompare?.metrics?.pageviews || null },
+    { key: "visitors", label: t("visitors"), value: formatNumber(state.overview.visitors), compare: state.overviewCompare?.metrics?.visitors || null },
+    { key: "sessions", label: t("sessions"), value: formatNumber(state.overview.sessions), compare: state.overviewCompare?.metrics?.sessions || null },
+    { key: "events", label: t("totalEvents"), value: formatNumber(state.overview.events), compare: state.overviewCompare?.metrics?.events || null },
+    { key: "revenue", label: t("revenueTotal"), value: formatMoney(state.overview.revenue), compare: state.overviewCompare?.metrics?.revenue || null },
   ]);
+
+  const compareSummary = computed(() => {
+    if (!state.overviewCompare?.metrics) {
+      return [];
+    }
+    return [
+      { key: "pageviews", label: t("pageviews"), metric: state.overviewCompare.metrics.pageviews },
+      { key: "visitors", label: t("visitors"), metric: state.overviewCompare.metrics.visitors },
+      { key: "sessions", label: t("sessions"), metric: state.overviewCompare.metrics.sessions },
+      { key: "events", label: t("totalEvents"), metric: state.overviewCompare.metrics.events },
+      { key: "revenue", label: t("revenueTotal"), metric: state.overviewCompare.metrics.revenue },
+    ];
+  });
+
+  const realtimeHighlights = computed(() => {
+    const realtime = state.realtime || {};
+    return [
+      { key: "visitors", label: t("activeVisitors"), value: formatNumber(realtime.active_visitors || 0) },
+      { key: "sessions", label: t("activeSessions"), value: formatNumber(realtime.active_sessions || 0) },
+      { key: "window", label: t("realtimeWindow"), value: `${realtime.window_minutes || 5}m` },
+    ];
+  });
 
   const shareMetrics = computed(() => {
     const overview = state.publicShare?.overview || {};
@@ -758,6 +784,7 @@ export function createAppController({ t, localeRef }) {
     validRoutes,
     loadRouteData: () => analyticsActions.loadRouteData(),
     refreshActive: () => analyticsActions.refreshActive(),
+    loadRealtime: () => analyticsActions.loadRealtime(),
     loadWebsites: () => adminActions.loadWebsites(),
     editUser: user => adminActions.editUser(user),
     userForm,
@@ -827,6 +854,7 @@ export function createAppController({ t, localeRef }) {
     navItems,
     routeMeta,
     overviewCards,
+    compareSummary,
     shareMetrics,
     roleCards,
     userPermissionSummary,
@@ -849,6 +877,7 @@ export function createAppController({ t, localeRef }) {
     filteredRevenue,
     filteredAttribution,
     overviewTrendMax,
+    realtimeHighlights,
     overviewHighlights,
     pageHighlights,
     eventHighlights,
@@ -898,6 +927,8 @@ export function createAppController({ t, localeRef }) {
     saveUser: adminActions.saveUser,
     saveSettings: adminActions.saveSettings,
     createBackup: adminActions.createBackup,
+    runCleanup: adminActions.runCleanup,
+    exportData: adminActions.exportData,
     editWebsite: adminActions.editWebsite,
     editUser: adminActions.editUser,
     resetWebsiteForm: adminActions.resetWebsiteForm,

@@ -68,6 +68,7 @@ export function createAnalyticsActions(ctx) {
     if (data?.overview) {
       state.overview = data.overview;
     }
+    state.overviewCompare = data?.compare || null;
     state.overviewTrend = data?.trend || [];
   }
 
@@ -139,6 +140,11 @@ export function createAnalyticsActions(ctx) {
     state.publicShare = data;
   }
 
+  async function loadRealtime() {
+    const data = await safeRequest(buildAnalyticsUrl("/api/analytics/realtime"), { swallow: true });
+    state.realtime = data?.realtime || null;
+  }
+
   return {
     buildAnalyticsUrl,
     refreshActive,
@@ -155,5 +161,6 @@ export function createAnalyticsActions(ctx) {
     loadFunnels,
     runFunnel,
     loadPublicShare,
+    loadRealtime,
   };
 }

@@ -79,6 +79,10 @@
               <option value="error">error</option>
             </select>
           </label>
+          <label>
+            <span>{{ app.t("dataRetentionDays") }}</span>
+            <input v-model.number="app.settingsForm.data_retention_days" type="number" min="7" step="1" required />
+          </label>
           <div class="form-actions">
             <button class="primary-button">{{ app.t("save") }}</button>
           </div>
@@ -95,9 +99,15 @@
 
         <div class="ops-stack">
           <button class="primary-button" @click="app.createBackup">{{ app.t("createBackupNow") }}</button>
+          <button class="ghost-button" @click="app.runCleanup">{{ app.t("runCleanupNow") }}</button>
+          <button class="ghost-button" @click="app.exportData('sessions', 'csv')">{{ app.t("exportSessions") }}</button>
           <div class="form-block">
             <strong>{{ app.t("latestBackupPath") }}</strong>
             <pre>{{ app.state.backupPath || app.t("noBackupYet") }}</pre>
+          </div>
+          <div class="form-block">
+            <strong>{{ app.t("lastCleanupAt") }}</strong>
+            <pre>{{ app.state.settings?.last_cleanup_at || app.state.cleanupResult?.last_cleanup_at || app.t("noData") }}</pre>
           </div>
         </div>
       </article>

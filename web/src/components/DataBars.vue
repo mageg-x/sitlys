@@ -1,13 +1,13 @@
 <template>
-  <p v-if="!rows.length" class="empty-note">{{ emptyText }}</p>
+  <p v-if="!safeRows.length" class="empty-note">{{ emptyText }}</p>
   <div v-else class="bar-list">
-    <div v-for="(item, index) in rows.slice(0, 8)" :key="`${item[labelKey]}-${index}`" class="bar-row">
+    <div v-for="(item, index) in safeRows.slice(0, 8)" :key="`${item?.[labelKey] ?? index}-${index}`" class="bar-row">
       <div class="bar-caption">
-        <strong>{{ item[labelKey] || "-" }}</strong>
-        <span>{{ Number(item[valueKey] || 0).toLocaleString() }}</span>
+        <strong>{{ item?.[labelKey] || "-" }}</strong>
+        <span>{{ Number(item?.[valueKey] || 0).toLocaleString() }}</span>
       </div>
       <div class="bar-track">
-        <div class="bar-fill" :style="{ width: `${Math.max(12, (Number(item[valueKey] || 0) / maxValue) * 100)}%` }"></div>
+        <div class="bar-fill" :style="{ width: `${Math.max(12, (Number(item?.[valueKey] || 0) / maxValue) * 100)}%` }"></div>
       </div>
     </div>
   </div>
@@ -23,7 +23,8 @@ const props = defineProps({
   emptyText: { type: String, default: "" },
 });
 
-const maxValue = computed(() => Math.max(...props.rows.map(item => Number(item[props.valueKey] || 0)), 1));
+const safeRows = computed(() => Array.isArray(props.rows) ? props.rows : []);
+const maxValue = computed(() => Math.max(...safeRows.value.map(item => Number(item?.[props.valueKey] || 0)), 1));
 </script>
 
 <style scoped>

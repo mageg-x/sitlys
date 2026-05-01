@@ -53,6 +53,7 @@ export function createAdminActions(ctx) {
       settingsForm.listen_addr = state.settings.listen_addr || "";
       settingsForm.database_path = state.settings.database_path || "";
       settingsForm.log_level = state.settings.log_level || "info";
+      settingsForm.data_retention_days = state.settings.data_retention_days || 365;
     }
   }
 
@@ -63,16 +64,20 @@ export function createAdminActions(ctx) {
           method: "PUT",
           body: { name: websiteForm.name, domain: websiteForm.domain },
         });
+        state.websiteId = websiteForm.id;
         state.notice = t("saveSuccess");
       } else {
-        await request("/api/websites", {
+        const response = await request("/api/websites", {
           method: "POST",
           body: { name: websiteForm.name, domain: websiteForm.domain },
         });
+        state.websiteId = response?.id || state.websiteId;
         state.notice = t("createSuccess");
       }
       resetWebsiteForm();
       await loadWebsites();
+      localStorage.setItem("sitlys.website_id", state.websiteId);
+      await ctx.refreshActive();
     });
   }
 
@@ -179,6 +184,7 @@ export function createAdminActions(ctx) {
           listen_addr: settingsForm.listen_addr,
           database_path: settingsForm.database_path,
           log_level: settingsForm.log_level,
+          data_retention_days: Number(settingsForm.data_retention_days || 365),
         },
       });
       await loadSettings();
@@ -193,6 +199,28 @@ export function createAdminActions(ctx) {
       state.backupPath = response.backup_path || "";
       state.notice = t("backupCreated");
     });
+  }
+
+  async function runCleanup() {
+    if (!isSuperAdmin.value) return;
+    await runSubmit(async () => {
+      const response = await request("/api/settings/cleanup", { method: "POST" });
+      state.cleanupResult = response.result || null;
+      if (state.cleanupResult?.last_cleanup_at) {
+        settingsForm.last_cleanup_at = state.cleanupResult.last_cleanup_at;
+      }
+      await loadSettings();
+      state.notice = t("cleanupFinished");
+    });
+  }
+
+  async function exportData(kind = "events", format = "csv") {
+    if (!state.websiteId) {
+      state.error = t("websiteRequired");
+      return;
+    }
+    const url = `/api/analytics/export?website_id=${encodeURIComponent(state.websiteId)}&from=${state.from}&to=${state.to}&kind=${encodeURIComponent(kind)}&format=${encodeURIComponent(format)}`;
+    window.open(url, "_blank", "noopener,noreferrer");
   }
 
   function editWebsite(site) {
@@ -304,6 +332,8 @@ export function createAdminActions(ctx) {
     saveUser,
     saveSettings,
     createBackup,
+    runCleanup,
+    exportData,
     editWebsite,
     editUser,
     resetWebsiteForm,

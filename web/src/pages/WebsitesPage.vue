@@ -35,7 +35,7 @@
         <div class="panel-head">
           <div>
             <h3>{{ app.websiteForm.id ? app.t("edit") : app.t("createWebsite") }}</h3>
-            <p>{{ app.t("websiteListText") }}</p>
+            <p>{{ app.t("manageWebsiteHint") }}</p>
           </div>
         </div>
 
@@ -55,19 +55,28 @@
           </div>
         </form>
 
-        <section class="setting-card">
-          <span>{{ app.t("trackerSnippet") }}</span>
-          <pre>{{ app.trackerSnippet }}</pre>
+        <section class="form-block">
+          <strong>{{ app.t("installationSteps") }}</strong>
+          <div class="step-guide">
+            <span>{{ app.t("stepCreateWebsite") }}</span>
+            <span>{{ app.t("stepPasteScript") }}</span>
+            <span>{{ app.t("stepVerifyData") }}</span>
+          </div>
         </section>
       </article>
 
       <article class="panel workspace-panel">
         <div class="panel-head">
           <div>
-            <h3>{{ app.t("websites") }}</h3>
-            <p>{{ app.t("installationGuide") }}</p>
+            <h3>{{ app.t("accessScript") }}</h3>
+            <p>{{ app.t("trackerReady") }}</p>
           </div>
         </div>
+
+        <section class="setting-card">
+          <span>{{ app.t("trackerSnippet") }}</span>
+          <pre>{{ app.trackerSnippet }}</pre>
+        </section>
 
         <div v-if="app.state.websites.length" class="card-list">
           <button
@@ -154,6 +163,13 @@ const app = useAppController();
 .workspace-panel :deep(pre) {
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+.step-guide {
+  display: grid;
+  gap: 0.55rem;
+  color: var(--muted);
+  line-height: 1.7;
 }
 
 .compact-signal-grid {

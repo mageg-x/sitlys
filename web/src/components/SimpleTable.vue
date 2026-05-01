@@ -1,5 +1,5 @@
 <template>
-  <p v-if="!rows.length" class="empty-note">{{ emptyText }}</p>
+  <p v-if="!safeRows.length" class="empty-note">{{ emptyText }}</p>
   <div v-else class="table-wrap">
     <table class="data-table">
       <thead>
@@ -8,9 +8,9 @@
         </tr>
       </thead>
       <tbody>
-        <tr v-for="(row, index) in rows" :key="row.id || row.path || row.referrer || row.name || row.source || index">
+        <tr v-for="(row, index) in safeRows" :key="row?.id || row?.path || row?.referrer || row?.name || row?.source || index">
           <td v-for="column in columns" :key="column.key">
-            {{ column.format ? column.format(row) : row[column.key] ?? "-" }}
+            {{ column.format ? column.format(row) : row?.[column.key] ?? "-" }}
           </td>
         </tr>
       </tbody>
@@ -19,11 +19,15 @@
 </template>
 
 <script setup>
-defineProps({
+import { computed } from "vue";
+
+const props = defineProps({
   rows: { type: Array, default: () => [] },
   columns: { type: Array, default: () => [] },
   emptyText: { type: String, default: "" },
 });
+
+const safeRows = computed(() => Array.isArray(props.rows) ? props.rows : []);
 </script>
 
 <style scoped>
