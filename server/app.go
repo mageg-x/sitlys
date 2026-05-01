@@ -61,6 +61,9 @@ type App struct {
 	workerWG    sync.WaitGroup
 	rateMu      sync.Mutex
 	rateBuckets map[string]rateBucket
+	botModeMu   sync.RWMutex
+	botMode     string
+	botModeAt   time.Time
 	botAuditMu  sync.Mutex
 	botAudit    map[string]int
 }
@@ -294,6 +297,7 @@ func New(cfg Config) (*App, error) {
 		db:          db,
 		eventQueue:  make(chan queuedEvent, 8192),
 		rateBuckets: make(map[string]rateBucket),
+		botMode:     "balanced",
 		botAudit:    make(map[string]int),
 	}
 	if err := app.initSchema(); err != nil {
@@ -1215,6 +1219,7 @@ func (a *App) getSystemSettings() (SystemSettings, error) {
 
 func (a *App) setSystemSettings(values map[string]string) error {
 	now := iso(nowUTC())
+	nextBotMode, hasBotMode := values["bot_filter_mode"]
 	tx, err := a.db.Begin()
 	if err != nil {
 		return err
@@ -1232,7 +1237,13 @@ func (a *App) setSystemSettings(values map[string]string) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if hasBotMode {
+		a.updateBotFilterModeCache(nextBotMode)
+	}
+	return nil
 }
 
 func (a *App) createBackup() (string, error) {
@@ -1245,6 +1256,9 @@ func (a *App) createBackup() (string, error) {
 	cleanBackupDir := filepath.Clean(backupDir)
 	cleanTargetPath := filepath.Clean(targetPath)
 	if filepath.Dir(cleanTargetPath) != cleanBackupDir {
+		return "", fmt.Errorf("invalid backup target path")
+	}
+	if strings.ContainsAny(cleanTargetPath, "'\x00\r\n") {
 		return "", fmt.Errorf("invalid backup target path")
 	}
 	escaped := strings.ReplaceAll(targetPath, "'", "''")
@@ -1275,16 +1289,7 @@ func normalizeEventCreatedAt(timestamp int64, now time.Time) time.Time {
 }
 
 func (a *App) shouldIgnoreBotTraffic(r *http.Request) (bool, string) {
-	settings := SystemSettings{BotFilterMode: "balanced"}
-	if a != nil && a.db != nil {
-		if loaded, err := a.getSystemSettings(); err == nil {
-			settings = loaded
-		}
-	}
-	mode := strings.TrimSpace(strings.ToLower(settings.BotFilterMode))
-	if mode == "" {
-		mode = "balanced"
-	}
+	mode := a.botFilterModeValue()
 	if mode == "off" {
 		return false, ""
 	}
@@ -1298,6 +1303,59 @@ func (a *App) shouldIgnoreBotTraffic(r *http.Request) (bool, string) {
 		return true, "preview_bot"
 	}
 	return false, ""
+}
+
+func normalizeBotFilterMode(mode string) string {
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case "off":
+		return "off"
+	case "strict":
+		return "strict"
+	default:
+		return "balanced"
+	}
+}
+
+func (a *App) updateBotFilterModeCache(mode string) {
+	if a == nil {
+		return
+	}
+	a.botModeMu.Lock()
+	defer a.botModeMu.Unlock()
+	a.botMode = normalizeBotFilterMode(mode)
+	a.botModeAt = nowUTC()
+}
+
+func (a *App) botFilterModeValue() string {
+	if a == nil {
+		return "balanced"
+	}
+
+	a.botModeMu.RLock()
+	mode := a.botMode
+	loadedAt := a.botModeAt
+	a.botModeMu.RUnlock()
+	if mode == "" {
+		mode = "balanced"
+	}
+	if !loadedAt.IsZero() && time.Since(loadedAt) < 5*time.Second {
+		return mode
+	}
+	if a.db == nil {
+		return mode
+	}
+	settings, err := a.getSystemSettings()
+	if err != nil {
+		return mode
+	}
+	a.updateBotFilterModeCache(settings.BotFilterMode)
+
+	a.botModeMu.RLock()
+	defer a.botModeMu.RUnlock()
+	if a.botMode == "" {
+		return "balanced"
+	}
+	return a.botMode
 }
 
 func (a *App) recordBotAudit(reason string) {

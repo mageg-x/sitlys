@@ -56,7 +56,28 @@ const workspaceRegistry = {
 
 const workspaceComponent = computed(() => workspaceRegistry[app.state.route] || OverviewPage);
 
+let realtimeTimer = null;
+
+function startRealtimePolling() {
+  stopRealtimePolling();
+  realtimeTimer = window.setInterval(() => {
+    if (app.state.mode !== "app" || app.state.route !== "overview" || !app.state.websiteId) {
+      return;
+    }
+    void app.loadRealtime();
+  }, 10000);
+}
+
+function stopRealtimePolling() {
+  if (realtimeTimer) {
+    window.clearInterval(realtimeTimer);
+    realtimeTimer = null;
+  }
+}
+
 onMounted(app.bootstrap);
 onMounted(() => window.addEventListener("hashchange", app.handleHashChange));
+onMounted(startRealtimePolling);
 onUnmounted(() => window.removeEventListener("hashchange", app.handleHashChange));
+onUnmounted(stopRealtimePolling);
 </script>

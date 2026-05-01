@@ -18,6 +18,8 @@ export function createAuthActions(ctx) {
     const savedLocale = localStorage.getItem("sitlys.locale");
     if (savedLocale) {
       localeRef.value = savedLocale;
+    } else {
+      localeRef.value = navigator.language?.toLowerCase().startsWith("zh") ? "zh-CN" : "en-US";
     }
     if (window.location.pathname.startsWith("/share/")) {
       state.mode = "share";

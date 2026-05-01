@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -140,6 +141,64 @@ func TestIsPreviewBotTraffic(t *testing.T) {
 	}
 	if isPreviewBotTraffic("Mozilla/5.0") {
 		t.Fatal("did not expect normal browser UA to be treated as preview bot traffic")
+	}
+}
+
+func TestHandleSendAcceptsUnknownCollectionFields(t *testing.T) {
+	app := newTestApp(t)
+	websiteID := seedWebsite(t, app, "Demo", "demo.local")
+
+	body := []byte(`{"type":"pageview","payload":{"website":"` + websiteID + `","url":"https://demo.local/","id":"visitor-1","unexpected":"ok"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/send", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	rec := httptest.NewRecorder()
+
+	app.handleSend(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleChangePasswordRejectsUnknownFields(t *testing.T) {
+	app := newTestApp(t)
+	_, token := seedUser(t, app, "owner", roleSuperAdmin, nil)
+
+	body := []byte(`{"current_password":"password123","new_password":"password456","unexpected":"x"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/password", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
+	rec := httptest.NewRecorder()
+
+	app.handleChangePassword(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBotFilterModeCacheRefreshesAfterSettingsChange(t *testing.T) {
+	app := newTestApp(t)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Purpose", "prefetch")
+
+	ignored, reason := app.shouldIgnoreBotTraffic(req)
+	if !ignored || reason != "prefetch" {
+		t.Fatalf("expected balanced mode to ignore prefetch traffic, got ignored=%v reason=%q", ignored, reason)
+	}
+
+	if err := app.setSystemSettings(map[string]string{
+		"listen_addr":         "127.0.0.1:8080",
+		"database_path":       app.cfg.DBPath,
+		"log_level":           "info",
+		"data_retention_days": "365",
+		"bot_filter_mode":     "off",
+	}); err != nil {
+		t.Fatalf("set settings: %v", err)
+	}
+
+	ignored, reason = app.shouldIgnoreBotTraffic(req)
+	if ignored || reason != "" {
+		t.Fatalf("expected off mode to stop filtering, got ignored=%v reason=%q", ignored, reason)
 	}
 }
 
@@ -504,6 +563,20 @@ func TestCreateBackupWritesDatabaseSnapshot(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("expected website in backup, got %d", count)
+	}
+}
+
+func TestCreateBackupRejectsQuotedDataDir(t *testing.T) {
+	app := newTestApp(t)
+	app.cfg.DataDir = filepath.Join(t.TempDir(), "bad'path")
+	app.cfg.DBPath = filepath.Join(app.cfg.DataDir, "sitlys.db")
+	if err := os.MkdirAll(app.cfg.DataDir, 0o755); err != nil {
+		t.Fatalf("mkdir bad data dir: %v", err)
+	}
+
+	_, err := app.createBackup()
+	if err == nil || !strings.Contains(err.Error(), "invalid backup target path") {
+		t.Fatalf("expected invalid backup target path error, got %v", err)
 	}
 }
 

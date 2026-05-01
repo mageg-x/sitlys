@@ -247,7 +247,7 @@ func (a *App) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req changePasswordRequest
-	if err := decodeCollectionJSON(r, &req); err != nil {
+	if err := decodeJSON(r, &req); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -457,9 +457,10 @@ func (a *App) handleUserByID(w http.ResponseWriter, r *http.Request) {
 		parts = append(parts, "password_hash = ?")
 		args = append(args, hash)
 	}
+	changedFields := len(parts)
 	parts = append(parts, "updated_at = ?")
 	args = append(args, iso(nowUTC()), userID)
-	if len(parts) > 1 {
+	if changedFields > 0 {
 		if _, err := tx.Exec(`update users set `+strings.Join(parts, ", ")+` where id = ?`, args...); err != nil {
 			errorResponse(w, http.StatusBadRequest, "update user failed")
 			return
@@ -952,7 +953,7 @@ func (a *App) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req eventRequest
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeCollectionJSON(r, &req); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -1303,7 +1304,7 @@ func (a *App) findOrCreateSession(candidate sessionRecord) (sessionRecord, error
 			existing.ExitPath = candidate.ExitPath
 		}
 		existing.EventCount++
-		if candidate.EntryPath != "" {
+		if candidate.Pageviews > 0 {
 			existing.Pageviews++
 		}
 		_, err := a.db.Exec(`
@@ -1319,7 +1320,7 @@ func (a *App) findOrCreateSession(candidate sessionRecord) (sessionRecord, error
 
 	candidate.ID = newID()
 	candidate.EventCount = 1
-	if candidate.EntryPath != "" {
+	if candidate.Pageviews > 0 {
 		candidate.Pageviews = 1
 	}
 	_, err = a.db.Exec(`

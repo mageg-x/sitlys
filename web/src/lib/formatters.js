@@ -12,6 +12,6 @@ export function formatPercent(value) {
   return `${(Number(value || 0) * 100).toFixed(1)}%`;
 }
 
-export function formatMoney(value, currency = "USD") {
+export function formatMoney(value, currency = "N/A") {
   return `${currency} ${Number(value || 0).toFixed(2)}`;
 }

@@ -17,8 +17,9 @@
     var body = JSON.stringify({ type: type, payload: payload });
     if (navigator.sendBeacon) {
       var blob = new Blob([body], { type: "application/json" });
-      navigator.sendBeacon(origin + "/api/send", blob);
-      return;
+      if (navigator.sendBeacon(origin + "/api/send", blob)) {
+        return;
+      }
     }
     fetch(origin + "/api/send", {
       method: "POST",
@@ -56,5 +57,32 @@
     }
   };
 
+  var lastURL = window.location.href;
+
+  function trackPageviewIfChanged() {
+    var nextURL = window.location.href;
+    if (nextURL === lastURL) return;
+    lastURL = nextURL;
+    collect("pageview", basePayload());
+  }
+
   collect("pageview", basePayload());
+
+  window.addEventListener("hashchange", trackPageviewIfChanged);
+
+  var originalPushState = window.history && window.history.pushState;
+  if (originalPushState) {
+    window.history.pushState = function () {
+      originalPushState.apply(window.history, arguments);
+      trackPageviewIfChanged();
+    };
+  }
+
+  var originalReplaceState = window.history && window.history.replaceState;
+  if (originalReplaceState) {
+    window.history.replaceState = function () {
+      originalReplaceState.apply(window.history, arguments);
+      trackPageviewIfChanged();
+    };
+  }
 })();

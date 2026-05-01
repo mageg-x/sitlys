@@ -223,7 +223,21 @@ export function createAdminActions(ctx) {
       return;
     }
     const url = `/api/analytics/export?website_id=${encodeURIComponent(state.websiteId)}&from=${state.from}&to=${state.to}&kind=${encodeURIComponent(kind)}&format=${encodeURIComponent(format)}`;
-    window.open(url, "_blank", "noopener,noreferrer");
+    const response = await fetch(url, { credentials: "include" });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error || t("requestFailed"));
+    }
+    const blob = await response.blob();
+    const objectURL = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    const extension = format === "json" ? "json" : "csv";
+    anchor.href = objectURL;
+    anchor.download = `sitlys-${kind}-${state.from}-${state.to}.${extension}`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(objectURL);
   }
 
   function editWebsite(site) {
