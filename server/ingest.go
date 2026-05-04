@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -174,17 +175,18 @@ func (a *App) upsertVisitorTx(tx *sql.Tx, websiteID, externalID string, seenAt t
 func (a *App) findOrCreateSessionTx(tx *sql.Tx, candidate sessionRecord) (sessionRecord, bool, error) {
 	var existing sessionRecord
 	var startedAtText, lastSeenText string
+	windowStart := candidate.StartedAt.UTC().Truncate(30 * time.Minute)
+	candidate.SessionKey = sessionWindowKey(candidate.WebsiteID, candidate.VisitorID, windowStart)
 	row := tx.QueryRow(`
-		select id, website_id, visitor_id, started_at, last_seen_at, event_count, pageviews,
+		select id, session_key, website_id, visitor_id, started_at, last_seen_at, event_count, pageviews,
 		       referrer, referrer_domain, utm_source, utm_medium, utm_campaign,
 		       browser, os, device, country, region, city, entry_path, exit_path
 		from sessions
-		where website_id = ? and visitor_id = ?
-		order by last_seen_at desc
+		where session_key = ?
 		limit 1
-	`, candidate.WebsiteID, candidate.VisitorID)
+	`, candidate.SessionKey)
 	err := row.Scan(
-		&existing.ID, &existing.WebsiteID, &existing.VisitorID, &startedAtText, &lastSeenText,
+		&existing.ID, &existing.SessionKey, &existing.WebsiteID, &existing.VisitorID, &startedAtText, &lastSeenText,
 		&existing.EventCount, &existing.Pageviews, &existing.Referrer, &existing.ReferrerDomain,
 		&existing.UTMSource, &existing.UTMMedium, &existing.UTMCampaign, &existing.Browser,
 		&existing.OS, &existing.Device, &existing.Country, &existing.Region, &existing.City,
@@ -221,17 +223,24 @@ func (a *App) findOrCreateSessionTx(tx *sql.Tx, candidate sessionRecord) (sessio
 	}
 	_, err = tx.Exec(`
 		insert into sessions(
-			id, website_id, visitor_id, started_at, last_seen_at, event_count, pageviews,
+			id, session_key, website_id, visitor_id, started_at, last_seen_at, event_count, pageviews,
 			referrer, referrer_domain, utm_source, utm_medium, utm_campaign,
 			browser, os, device, country, region, city, entry_path, exit_path
-		) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		candidate.ID, candidate.WebsiteID, candidate.VisitorID, iso(candidate.StartedAt), iso(candidate.LastSeenAt),
+		candidate.ID, candidate.SessionKey, candidate.WebsiteID, candidate.VisitorID, iso(candidate.StartedAt), iso(candidate.LastSeenAt),
 		candidate.EventCount, candidate.Pageviews, candidate.Referrer, candidate.ReferrerDomain,
 		candidate.UTMSource, candidate.UTMMedium, candidate.UTMCampaign, candidate.Browser, candidate.OS,
 		candidate.Device, candidate.Country, candidate.Region, candidate.City, candidate.EntryPath, candidate.ExitPath,
 	)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "unique") {
+		return a.findOrCreateSessionTx(tx, candidate)
+	}
 	return candidate, true, err
+}
+
+func sessionWindowKey(websiteID, visitorID string, windowStart time.Time) string {
+	return websiteID + ":" + visitorID + ":" + windowStart.Format(time.RFC3339)
 }
 
 func (a *App) insertEventTx(tx *sql.Tx, record eventRecord) error {
@@ -262,14 +271,31 @@ func (a *App) updateAggregatesTx(tx *sql.Tx, record eventRecord, session session
 	} else {
 		customEvents = 1
 	}
+	visitorDelta := 0
+	sessionDelta := 0
+	if isNewSession {
+		sessionDelta = 1
+		result, err := tx.Exec(`
+			insert or ignore into agg_visitor_daily(website_id, bucket_date, visitor_id)
+			values(?, ?, ?)
+		`, record.WebsiteID, day, record.VisitorID)
+		if err != nil {
+			return err
+		}
+		if affected, err := result.RowsAffected(); err == nil && affected > 0 {
+			visitorDelta = 1
+		}
+	}
 	if _, err := tx.Exec(`
-		insert into agg_overview_daily(website_id, bucket_date, pageviews, custom_events, revenue)
-		values(?, ?, ?, ?, ?)
+		insert into agg_overview_daily(website_id, bucket_date, pageviews, custom_events, visitors, sessions, revenue)
+		values(?, ?, ?, ?, ?, ?, ?)
 		on conflict(website_id, bucket_date) do update set
 			pageviews = pageviews + excluded.pageviews,
 			custom_events = custom_events + excluded.custom_events,
+			visitors = visitors + excluded.visitors,
+			sessions = sessions + excluded.sessions,
 			revenue = revenue + excluded.revenue
-	`, record.WebsiteID, day, pageviews, customEvents, record.Amount); err != nil {
+	`, record.WebsiteID, day, pageviews, customEvents, visitorDelta, sessionDelta, record.Amount); err != nil {
 		return err
 	}
 

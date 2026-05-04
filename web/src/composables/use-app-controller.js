@@ -1,6 +1,6 @@
 import { computed, inject, provide, proxyRefs, reactive } from "vue";
 import { defaultFunnelSteps } from "../lib/defaults";
-import { dateOffset, formatMoney, formatNumber, formatPercent } from "../lib/formatters";
+import { dateOffset, formatDurationSeconds, formatMoney, formatNumber, formatPercent } from "../lib/formatters";
 import { VALID_ROUTES } from "../lib/routes";
 import { apiRequest } from "../services/api";
 import { createAdminActions } from "./use-admin-actions";
@@ -38,7 +38,7 @@ export function createAppController({ t, localeRef }) {
     me: null,
     websites: [],
     websiteId: "",
-    overview: { pageviews: 0, visitors: 0, sessions: 0, events: 0, revenue: 0 },
+    overview: { pageviews: 0, visitors: 0, sessions: 0, events: 0, revenue: 0, bounce_rate: 0, avg_session_duration_seconds: 0 },
     overviewCompare: null,
     overviewTrend: [],
     pages: [],
@@ -172,6 +172,9 @@ export function createAppController({ t, localeRef }) {
     { key: "sessions", label: t("sessions"), value: formatNumber(state.overview.sessions), compare: state.overviewCompare?.metrics?.sessions || null },
     { key: "events", label: t("totalEvents"), value: formatNumber(state.overview.events), compare: state.overviewCompare?.metrics?.events || null },
     { key: "revenue", label: t("revenueTotal"), value: formatMoney(state.overview.revenue), compare: state.overviewCompare?.metrics?.revenue || null },
+    { key: "bounce_rate", label: t("bounceRate"), value: formatPercent(state.overview.bounce_rate), compare: state.overviewCompare?.metrics?.bounce_rate || null },
+    { key: "avg_session_duration_seconds", label: t("avgSessionDuration"), value: formatDurationSeconds(state.overview.avg_session_duration_seconds), compare: state.overviewCompare?.metrics?.avg_session_duration_seconds || null },
+    { key: "avg_time_on_page_seconds", label: t("avgTimeOnPage"), value: formatDurationSeconds(state.overview.avg_time_on_page_seconds), compare: state.overviewCompare?.metrics?.avg_time_on_page_seconds || null },
   ]);
 
   const compareSummary = computed(() => {
@@ -179,11 +182,14 @@ export function createAppController({ t, localeRef }) {
       return [];
     }
     return [
-      { key: "pageviews", label: t("pageviews"), metric: state.overviewCompare.metrics.pageviews },
-      { key: "visitors", label: t("visitors"), metric: state.overviewCompare.metrics.visitors },
-      { key: "sessions", label: t("sessions"), metric: state.overviewCompare.metrics.sessions },
-      { key: "events", label: t("totalEvents"), metric: state.overviewCompare.metrics.events },
-      { key: "revenue", label: t("revenueTotal"), metric: state.overviewCompare.metrics.revenue },
+      { key: "pageviews", label: t("pageviews"), metric: state.overviewCompare.metrics.pageviews, format: metric => formatNumber(metric.current), previousFormat: metric => formatNumber(metric.previous) },
+      { key: "visitors", label: t("visitors"), metric: state.overviewCompare.metrics.visitors, format: metric => formatNumber(metric.current), previousFormat: metric => formatNumber(metric.previous) },
+      { key: "sessions", label: t("sessions"), metric: state.overviewCompare.metrics.sessions, format: metric => formatNumber(metric.current), previousFormat: metric => formatNumber(metric.previous) },
+      { key: "events", label: t("totalEvents"), metric: state.overviewCompare.metrics.events, format: metric => formatNumber(metric.current), previousFormat: metric => formatNumber(metric.previous) },
+      { key: "revenue", label: t("revenueTotal"), metric: state.overviewCompare.metrics.revenue, format: metric => formatMoney(metric.current), previousFormat: metric => formatMoney(metric.previous) },
+      { key: "bounce_rate", label: t("bounceRate"), metric: state.overviewCompare.metrics.bounce_rate, format: metric => formatPercent(metric.current), previousFormat: metric => formatPercent(metric.previous) },
+      { key: "avg_session_duration_seconds", label: t("avgSessionDuration"), metric: state.overviewCompare.metrics.avg_session_duration_seconds, format: metric => formatDurationSeconds(metric.current), previousFormat: metric => formatDurationSeconds(metric.previous) },
+      { key: "avg_time_on_page_seconds", label: t("avgTimeOnPage"), metric: state.overviewCompare.metrics.avg_time_on_page_seconds, format: metric => formatDurationSeconds(metric.current), previousFormat: metric => formatDurationSeconds(metric.previous) },
     ];
   });
 
@@ -204,6 +210,7 @@ export function createAppController({ t, localeRef }) {
       { key: "sessions", label: t("sessions"), value: formatNumber(overview.sessions || 0) },
       { key: "events", label: t("totalEvents"), value: formatNumber(overview.events || 0) },
       { key: "revenue", label: t("revenueTotal"), value: formatMoney(overview.revenue || 0) },
+      { key: "avg_time_on_page_seconds", label: t("avgTimeOnPage"), value: formatDurationSeconds(overview.avg_time_on_page_seconds || 0) },
     ];
   });
 
@@ -321,6 +328,7 @@ export function createAppController({ t, localeRef }) {
     pageviews: Math.max(...state.overviewTrend.map(item => Number(item.pageviews || 0)), 1),
     events: Math.max(...state.overviewTrend.map(item => Number(item.events || 0)), 1),
     revenue: Math.max(...state.overviewTrend.map(item => Number(item.revenue || 0)), 1),
+    avgTimeOnPage: Math.max(...state.overviewTrend.map(item => Number(item.avg_time_on_page_seconds || 0)), 1),
   }));
 
   const overviewHighlights = computed(() => {
@@ -354,6 +362,12 @@ export function createAppController({ t, localeRef }) {
         value: sessions ? formatPercent(topCountryVisits / sessions) : "0.0%",
         tone: "rose",
       },
+      {
+        key: "avg-time-on-page-overview",
+        label: t("avgTimeOnPage"),
+        value: formatDurationSeconds(state.overview.avg_time_on_page_seconds || 0),
+        tone: "amber",
+      },
     ];
   });
 
@@ -361,6 +375,7 @@ export function createAppController({ t, localeRef }) {
     const top = topPage.value;
     const pageviews = Number(state.overview.pageviews || 0);
     const sessions = Number(state.overview.sessions || 0);
+    const longest = [...state.pages].sort((a, b) => Number(b.avg_time_on_page_seconds || 0) - Number(a.avg_time_on_page_seconds || 0))[0];
     return [
       {
         key: "focus-page",
@@ -379,6 +394,12 @@ export function createAppController({ t, localeRef }) {
         label: t("sessionDepth"),
         value: top ? formatPercent(Number(top.sessions || 0) / Math.max(sessions, 1)) : "0.0%",
         hint: t("sessions"),
+      },
+      {
+        key: "avg-time-on-page",
+        label: t("avgTimeOnPage"),
+        value: longest ? formatDurationSeconds(longest.avg_time_on_page_seconds || 0) : "0s",
+        hint: longest?.path || t("noData"),
       },
     ];
   });
@@ -610,6 +631,7 @@ export function createAppController({ t, localeRef }) {
     { key: "path", label: t("path") },
     { key: "pageviews", label: t("pageviews"), format: row => formatNumber(row.pageviews) },
     { key: "sessions", label: t("sessions"), format: row => formatNumber(row.sessions) },
+    { key: "avg_time_on_page_seconds", label: t("avgTimeOnPage"), format: row => formatDurationSeconds(row.avg_time_on_page_seconds) },
   ]);
 
   const entryColumns = computed(() => [
@@ -679,6 +701,7 @@ export function createAppController({ t, localeRef }) {
   const sharePageColumns = computed(() => [
     { key: "label", label: t("path") },
     { key: "count", label: t("pageviews"), format: row => formatNumber(row.count) },
+    { key: "avg_time_on_page_seconds", label: t("avgTimeOnPage"), format: row => formatDurationSeconds(row.avg_time_on_page_seconds) },
   ]);
 
   const shareReferrerColumns = computed(() => [
@@ -953,6 +976,7 @@ export function createAppController({ t, localeRef }) {
     formatNumber,
     formatPercent,
     formatMoney,
+    formatDurationSeconds,
     syncRouteFromHash: routeActions.syncRouteFromHash,
     handleHashChange: routeActions.handleHashChange,
   });

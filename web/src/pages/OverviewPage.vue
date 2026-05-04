@@ -28,8 +28,8 @@
         <div v-if="app.compareSummary.length" class="compare-grid">
           <div v-for="item in app.compareSummary" :key="item.key" class="compare-card">
             <span>{{ item.label }}</span>
-            <strong>{{ app.formatNumber(item.metric.current) }}</strong>
-            <small>{{ app.t("previousPeriod") }} · {{ app.formatNumber(item.metric.previous) }}</small>
+            <strong>{{ item.format ? item.format(item.metric) : app.formatNumber(item.metric.current) }}</strong>
+            <small>{{ app.t("previousPeriod") }} · {{ item.previousFormat ? item.previousFormat(item.metric) : app.formatNumber(item.metric.previous) }}</small>
             <em :class="{ up: Number(item.metric.change_rate) >= 0, down: Number(item.metric.change_rate) < 0 }">
               {{ Number(item.metric.change_rate) >= 0 ? "+" : "" }}{{ app.formatPercent(item.metric.change_rate) }}
             </em>
@@ -129,6 +129,10 @@
           <span>{{ app.t("trendRevenue") }}</span>
           <strong>{{ app.formatMoney(app.state.overviewTrend.reduce((sum, row) => sum + Number(row.revenue || 0), 0)) }}</strong>
         </div>
+        <div class="trend-card">
+          <span>{{ app.t("trendAvgTimeOnPage") }}</span>
+          <strong>{{ app.formatDurationSeconds(Math.round(app.state.overviewTrend.reduce((sum, row) => sum + Number(row.avg_time_on_page_seconds || 0), 0) / Math.max(app.state.overviewTrend.length, 1))) }}</strong>
+        </div>
       </div>
       <div v-if="app.state.overviewTrend.length" class="mini-series">
         <div v-for="row in app.state.overviewTrend" :key="row.date" class="mini-series-col">
@@ -136,6 +140,7 @@
             <div class="mini-series-bar pageviews" :style="{ height: `${Math.max(10, (Number(row.pageviews || 0) / app.overviewTrendPeaks.pageviews) * 100)}%` }"></div>
             <div class="mini-series-bar events" :style="{ height: `${Math.max(10, (Number(row.events || 0) / app.overviewTrendPeaks.events) * 100)}%` }"></div>
             <div class="mini-series-bar revenue" :style="{ height: `${Math.max(10, (Number(row.revenue || 0) / app.overviewTrendPeaks.revenue) * 100)}%` }"></div>
+            <div class="mini-series-bar time" :style="{ height: `${Math.max(10, (Number(row.avg_time_on_page_seconds || 0) / app.overviewTrendPeaks.avgTimeOnPage) * 100)}%` }"></div>
           </div>
           <span>{{ row.date.slice(5) }}</span>
         </div>
@@ -266,6 +271,10 @@ const app = useAppController();
 
 .mini-series-bar.revenue {
   background: linear-gradient(180deg, rgba(194, 108, 12, 0.96), rgba(255, 176, 71, 0.72));
+}
+
+.mini-series-bar.time {
+  background: linear-gradient(180deg, rgba(149, 76, 233, 0.96), rgba(193, 132, 255, 0.72));
 }
 
 .realtime-series {

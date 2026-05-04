@@ -208,6 +208,7 @@ type eventRecord struct {
 
 type sessionRecord struct {
 	ID             string
+	SessionKey     string
 	WebsiteID      string
 	VisitorID      string
 	StartedAt      time.Time
@@ -497,6 +498,7 @@ func (a *App) initSchema() error {
 		);`,
 		`create table if not exists sessions (
 			id text primary key,
+			session_key text not null default '',
 			website_id text not null,
 			visitor_id text not null,
 			started_at text not null,
@@ -516,6 +518,7 @@ func (a *App) initSchema() error {
 			city text not null default '',
 			entry_path text not null default '',
 			exit_path text not null default '',
+			unique (session_key),
 			foreign key (website_id) references websites(id) on delete cascade,
 			foreign key (visitor_id) references visitors(id) on delete cascade
 		);`,
@@ -571,8 +574,16 @@ func (a *App) initSchema() error {
 			bucket_date text not null,
 			pageviews integer not null default 0,
 			custom_events integer not null default 0,
+			visitors integer not null default 0,
+			sessions integer not null default 0,
 			revenue real not null default 0,
 			primary key (website_id, bucket_date)
+		);`,
+		`create table if not exists agg_visitor_daily (
+			website_id text not null,
+			bucket_date text not null,
+			visitor_id text not null,
+			primary key (website_id, bucket_date, visitor_id)
 		);`,
 		`create table if not exists agg_pages_daily (
 			website_id text not null,
@@ -639,20 +650,86 @@ func (a *App) initSchema() error {
 		}
 	}
 
-	if _, err := a.db.Exec(`alter table website_permissions add column access_level text not null default 'view'`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-		return fmt.Errorf("migrate website_permissions access_level: %w", err)
+	if !a.tableColumnExists("website_permissions", "access_level") {
+		if _, err := a.db.Exec(`alter table website_permissions add column access_level text not null default 'view'`); err != nil {
+			return fmt.Errorf("migrate website_permissions access_level: %w", err)
+		}
+	}
+	if a.tableColumnExists("website_permissions", "can_manage") {
+		if _, err := a.db.Exec(`
+			update website_permissions
+			set access_level = case
+				when access_level is null or access_level = '' then
+					case when can_manage = 1 then 'manage' else 'view' end
+				else access_level
+			end
+		`); err != nil {
+			return fmt.Errorf("backfill website_permissions access_level: %w", err)
+		}
+	}
+	for _, column := range []string{"visitors", "sessions"} {
+		if !a.tableColumnExists("agg_overview_daily", column) {
+			if _, err := a.db.Exec(`alter table agg_overview_daily add column ` + column + ` integer not null default 0`); err != nil {
+				return fmt.Errorf("migrate agg_overview_daily %s: %w", column, err)
+			}
+		}
+	}
+	if !a.tableColumnExists("sessions", "session_key") {
+		if _, err := a.db.Exec(`alter table sessions add column session_key text not null default ''`); err != nil {
+			return fmt.Errorf("migrate sessions session_key: %w", err)
+		}
+	}
+	if _, err := a.db.Exec(`create unique index if not exists idx_sessions_session_key on sessions(session_key) where session_key <> ''`); err != nil {
+		return fmt.Errorf("create sessions session_key index: %w", err)
 	}
 	if _, err := a.db.Exec(`
-		update website_permissions
-		set access_level = case
-			when access_level is null or access_level = '' then
-				case when can_manage = 1 then 'manage' else 'view' end
-			else access_level
-		end
-	`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "no such column: can_manage") {
-		return fmt.Errorf("backfill website_permissions access_level: %w", err)
+		update sessions
+		set session_key = website_id || ':' || visitor_id || ':' || strftime('%s', started_at)
+		where session_key = ''
+	`); err != nil {
+		return fmt.Errorf("backfill sessions session_key: %w", err)
+	}
+	if _, err := a.db.Exec(`
+		insert into agg_overview_daily(website_id, bucket_date, visitors, sessions)
+		select website_id, date(started_at), count(distinct visitor_id), count(*)
+		from sessions
+		group by website_id, date(started_at)
+		on conflict(website_id, bucket_date) do update set
+			visitors = excluded.visitors,
+			sessions = excluded.sessions
+	`); err != nil {
+		return fmt.Errorf("backfill agg_overview_daily sessions/visitors: %w", err)
+	}
+	if _, err := a.db.Exec(`
+		insert or ignore into agg_visitor_daily(website_id, bucket_date, visitor_id)
+		select website_id, date(started_at), visitor_id
+		from sessions
+	`); err != nil {
+		return fmt.Errorf("backfill agg_visitor_daily: %w", err)
 	}
 	return nil
+}
+
+func (a *App) tableColumnExists(tableName, columnName string) bool {
+	rows, err := a.db.Query(`pragma table_info(` + tableName + `)`)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, dataType string
+		var notNull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk); err != nil {
+			return false
+		}
+		if strings.EqualFold(name, columnName) {
+			return true
+		}
+	}
+	return false
 }
 
 func withLogging(next http.Handler) http.Handler {
@@ -952,6 +1029,30 @@ func cleanURL(raw string) (fullURL, host, path string) {
 		path = "/"
 	}
 	return raw, host, path
+}
+
+func normalizeWebsiteDomain(raw string) string {
+	value := strings.TrimSpace(strings.ToLower(raw))
+	if value == "" {
+		return ""
+	}
+	if !strings.Contains(value, "://") {
+		value = "https://" + value
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(strings.ToLower(parsed.Hostname()))
+}
+
+func hostMatchesWebsiteDomain(host, configuredDomain string) bool {
+	host = normalizeWebsiteDomain(host)
+	configuredDomain = normalizeWebsiteDomain(configuredDomain)
+	if host == "" || configuredDomain == "" {
+		return false
+	}
+	return host == configuredDomain || strings.HasSuffix(host, "."+configuredDomain)
 }
 
 func referrerDomain(raw string) string {

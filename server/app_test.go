@@ -139,6 +139,15 @@ func TestPathMatchesStepValue(t *testing.T) {
 	}
 }
 
+func TestHostMatchesWebsiteDomain(t *testing.T) {
+	if !hostMatchesWebsiteDomain("app.demo.local", "demo.local") {
+		t.Fatal("expected subdomain to match configured website domain")
+	}
+	if hostMatchesWebsiteDomain("demo.local.evil", "demo.local") {
+		t.Fatal("did not expect unrelated suffix host to match configured website domain")
+	}
+}
+
 func TestShouldIgnoreBotTraffic(t *testing.T) {
 	app := &App{}
 	req := httptest.NewRequest("GET", "/", nil)
@@ -191,6 +200,24 @@ func TestHandleSendAcceptsUnknownCollectionFields(t *testing.T) {
 func TestTrackerScriptListensToPopstate(t *testing.T) {
 	if !strings.Contains(trackerScript, "popstate") {
 		t.Fatal("expected tracker script to listen for popstate")
+	}
+}
+
+func TestTrackerScriptDoesNotTrackReplaceState(t *testing.T) {
+	if strings.Contains(trackerScript, "window.history.replaceState = function") {
+		t.Fatal("expected tracker script to stop tracking replaceState changes as pageviews")
+	}
+}
+
+func TestTrackerScriptTracksPageLeaveOnPagehide(t *testing.T) {
+	if !strings.Contains(trackerScript, "pagehide") {
+		t.Fatal("expected tracker script to track page leave on pagehide")
+	}
+	if !strings.Contains(trackerScript, "trackPageLeave(lastURL)") {
+		t.Fatal("expected tracker script to emit page_leave before SPA route pageview")
+	}
+	if !strings.Contains(trackerScript, "page_ping") || !strings.Contains(trackerScript, "setInterval") {
+		t.Fatal("expected tracker script to emit heartbeat page_ping events")
 	}
 }
 
@@ -460,28 +487,72 @@ func TestHandleOverviewReturnsTotalEvents(t *testing.T) {
 
 	var payload struct {
 		Overview struct {
-			Events int64 `json:"events"`
+			Visitors           int64   `json:"visitors"`
+			Sessions           int64   `json:"sessions"`
+			Events             int64   `json:"events"`
+			BounceRate         float64 `json:"bounce_rate"`
+			AvgSessionDuration int64   `json:"avg_session_duration_seconds"`
+			AvgTimeOnPage      int64   `json:"avg_time_on_page_seconds"`
 		} `json:"overview"`
 		Trend []struct {
-			Events int64 `json:"events"`
+			Visitors      int64 `json:"visitors"`
+			Sessions      int64 `json:"sessions"`
+			Events        int64 `json:"events"`
+			AvgTimeOnPage int64 `json:"avg_time_on_page_seconds"`
 		} `json:"trend"`
 		Compare struct {
 			Metrics struct {
 				Events struct {
 					Current int64 `json:"current"`
 				} `json:"events"`
+				Visitors struct {
+					Current int64 `json:"current"`
+				} `json:"visitors"`
+				Sessions struct {
+					Current int64 `json:"current"`
+				} `json:"sessions"`
 			} `json:"metrics"`
 		} `json:"compare"`
 	}
 	decodeTestJSON(t, rec.Body.Bytes(), &payload)
+	if payload.Overview.Visitors != 1 || payload.Overview.Sessions != 1 {
+		t.Fatalf("expected overview visitors/sessions to be 1/1, got %d/%d", payload.Overview.Visitors, payload.Overview.Sessions)
+	}
 	if payload.Overview.Events != 4 {
 		t.Fatalf("expected overview total events to be 4, got %d", payload.Overview.Events)
 	}
-	if len(payload.Trend) != 1 || payload.Trend[0].Events != 4 {
+	if payload.Overview.BounceRate != 0 || payload.Overview.AvgSessionDuration < 0 {
+		t.Fatalf("expected bounce rate 0 and non-negative avg duration, got bounce=%v duration=%d", payload.Overview.BounceRate, payload.Overview.AvgSessionDuration)
+	}
+	if payload.Overview.AvgTimeOnPage != 0 {
+		t.Fatalf("expected no dwell data in overview seed, got avg time on page %d", payload.Overview.AvgTimeOnPage)
+	}
+	if len(payload.Trend) != 1 || payload.Trend[0].Events != 4 || payload.Trend[0].Visitors != 1 || payload.Trend[0].Sessions != 1 || payload.Trend[0].AvgTimeOnPage != 0 {
 		t.Fatalf("expected trend total events to be 4, got %#v", payload.Trend)
 	}
-	if payload.Compare.Metrics.Events.Current != 4 {
-		t.Fatalf("expected compare current events to be 4, got %d", payload.Compare.Metrics.Events.Current)
+	if payload.Compare.Metrics.Events.Current != 4 || payload.Compare.Metrics.Visitors.Current != 1 || payload.Compare.Metrics.Sessions.Current != 1 {
+		t.Fatalf("unexpected compare metrics: %#v", payload.Compare.Metrics)
+	}
+}
+
+func TestRecordEventRejectsWebsiteDomainMismatch(t *testing.T) {
+	app := newTestApp(t)
+	websiteID := seedWebsite(t, app, "Demo", "demo.local")
+
+	req := httptest.NewRequest("POST", "/api/send", nil)
+	req.RemoteAddr = "203.0.113.20:4321"
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+
+	_, err := app.recordEvent(req, eventRequest{
+		Type: "pageview",
+		Payload: eventPayload{
+			Website: websiteID,
+			URL:     "https://evil.local/pricing",
+			ID:      "visitor-1",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "domain mismatch") {
+		t.Fatalf("expected website domain mismatch, got %v", err)
 	}
 }
 
@@ -508,8 +579,179 @@ func TestHandleBatchRateLimitsEachWebsite(t *testing.T) {
 	rec := httptest.NewRecorder()
 
 	app.handleBatch(rec, req)
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("expected 429, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 partial success, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var payload struct {
+		Partial bool `json:"partial"`
+		Items   []struct {
+			OK       bool   `json:"ok"`
+			Error    string `json:"error"`
+			Result   struct {
+				WebsiteID string `json:"website_id"`
+			} `json:"result"`
+			WebsiteID string `json:"website_id"`
+		} `json:"items"`
+	}
+	decodeTestJSON(t, rec.Body.Bytes(), &payload)
+	if !payload.Partial || len(payload.Items) != 2 {
+		t.Fatalf("unexpected batch payload: %#v", payload)
+	}
+	if !payload.Items[0].OK || payload.Items[1].OK || payload.Items[1].Error != "rate limit exceeded" {
+		t.Fatalf("unexpected batch item results: %#v", payload.Items)
+	}
+}
+
+func TestFindOrCreateSessionUsesStableWindowKey(t *testing.T) {
+	app := newTestApp(t)
+	websiteID := seedWebsite(t, app, "Demo", "demo.local")
+	base := time.Date(2026, 5, 1, 10, 5, 0, 0, time.UTC)
+
+	for _, offset := range []time.Duration{0, 10 * time.Minute, 24 * time.Minute} {
+		if err := app.writeEventImmediately(queuedEvent{
+			WebsiteID:  websiteID,
+			VisitorKey: "visitor-1",
+			EventType:  "pageview",
+			URL:        "https://demo.local/page",
+			URLPath:    "/page",
+			CreatedAt:  base.Add(offset),
+		}); err != nil {
+			t.Fatalf("seed session event at offset %s: %v", offset, err)
+		}
+	}
+
+	var sessions int
+	if err := app.db.QueryRow(`select count(*) from sessions where website_id = ?`, websiteID).Scan(&sessions); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if sessions != 1 {
+		t.Fatalf("expected stable session window to keep one session, got %d", sessions)
+	}
+}
+
+func TestHandlePagesReturnsTimeOnPageMetrics(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.routes()
+	websiteID := seedWebsite(t, app, "Demo", "demo.local")
+	_, token := seedUser(t, app, "analyst", roleAnalyst, []WebsitePermission{{WebsiteID: websiteID, AccessLevel: "view"}})
+	base := time.Date(2026, 5, 1, 9, 0, 0, 0, time.UTC)
+
+	seed := []queuedEvent{
+		{WebsiteID: websiteID, VisitorKey: "visitor-1", EventType: "pageview", URL: "https://demo.local/docs", URLPath: "/docs", CreatedAt: base},
+		{WebsiteID: websiteID, VisitorKey: "visitor-1", EventType: "event", EventName: "page_leave", URL: "https://demo.local/docs", URLPath: "/docs", Metadata: `{"duration_ms":12000}`, CreatedAt: base.Add(12 * time.Second)},
+	}
+	for _, item := range seed {
+		if err := app.writeEventImmediately(item); err != nil {
+			t.Fatalf("seed time-on-page event: %v", err)
+		}
+	}
+
+	req := authedJSONRequest(t, http.MethodGet, "/api/analytics/pages?website_id="+websiteID+"&from=2026-05-01&to=2026-05-01", nil, token)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var payload struct {
+		Items []struct {
+			Path                 string `json:"path"`
+			AvgTimeOnPageSeconds int64  `json:"avg_time_on_page_seconds"`
+			TimeOnPageSamples    int64  `json:"time_on_page_sample_count"`
+		} `json:"items"`
+	}
+	decodeTestJSON(t, rec.Body.Bytes(), &payload)
+	if len(payload.Items) != 1 || payload.Items[0].Path != "/docs" || payload.Items[0].AvgTimeOnPageSeconds != 12 || payload.Items[0].TimeOnPageSamples != 1 {
+		t.Fatalf("unexpected pages payload: %#v", payload.Items)
+	}
+}
+
+func TestHandleOverviewReturnsAverageTimeOnPage(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.routes()
+	websiteID := seedWebsite(t, app, "Demo", "demo.local")
+	_, token := seedUser(t, app, "analyst", roleAnalyst, []WebsitePermission{{WebsiteID: websiteID, AccessLevel: "view"}})
+	base := time.Date(2026, 5, 1, 9, 0, 0, 0, time.UTC)
+
+	for _, item := range []queuedEvent{
+		{WebsiteID: websiteID, VisitorKey: "visitor-1", EventType: "pageview", URL: "https://demo.local/docs", URLPath: "/docs", CreatedAt: base},
+		{WebsiteID: websiteID, VisitorKey: "visitor-1", EventType: "event", EventName: "page_ping", URL: "https://demo.local/docs", URLPath: "/docs", Metadata: `{"duration_ms":6000}`, CreatedAt: base.Add(6 * time.Second)},
+		{WebsiteID: websiteID, VisitorKey: "visitor-1", EventType: "event", EventName: "page_leave", URL: "https://demo.local/docs", URLPath: "/docs", Metadata: `{"duration_ms":9000}`, CreatedAt: base.Add(9 * time.Second)},
+	} {
+		if err := app.writeEventImmediately(item); err != nil {
+			t.Fatalf("seed overview dwell event: %v", err)
+		}
+	}
+
+	req := authedJSONRequest(t, http.MethodGet, "/api/analytics/overview?website_id="+websiteID+"&from=2026-05-01&to=2026-05-01", nil, token)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var payload struct {
+		Overview struct {
+			AvgTimeOnPage int64 `json:"avg_time_on_page_seconds"`
+		} `json:"overview"`
+		Trend []struct {
+			AvgTimeOnPage int64 `json:"avg_time_on_page_seconds"`
+		} `json:"trend"`
+		Compare struct {
+			Metrics struct {
+				AvgTimeOnPage struct {
+					Current int64 `json:"current"`
+				} `json:"avg_time_on_page_seconds"`
+			} `json:"metrics"`
+		} `json:"compare"`
+	}
+	decodeTestJSON(t, rec.Body.Bytes(), &payload)
+	if payload.Overview.AvgTimeOnPage != 8 || payload.Compare.Metrics.AvgTimeOnPage.Current != 8 || len(payload.Trend) != 1 || payload.Trend[0].AvgTimeOnPage != 8 {
+		t.Fatalf("unexpected avg time on page payload: %#v", payload)
+	}
+}
+
+func TestPublicShareIncludesAverageTimeOnPage(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.routes()
+	websiteID := seedWebsite(t, app, "Demo", "demo.local")
+	shareID := newID()
+	if _, err := app.db.Exec(`insert into shares(id, website_id, slug, enabled, created_at) values(?, ?, ?, 1, ?)`, shareID, websiteID, "demo-share", iso(nowUTC())); err != nil {
+		t.Fatalf("seed share: %v", err)
+	}
+	base := time.Date(2026, 5, 1, 9, 0, 0, 0, time.UTC)
+	for _, item := range []queuedEvent{
+		{WebsiteID: websiteID, VisitorKey: "visitor-1", EventType: "pageview", URL: "https://demo.local/docs", URLPath: "/docs", CreatedAt: base},
+		{WebsiteID: websiteID, VisitorKey: "visitor-1", EventType: "event", EventName: "page_leave", URL: "https://demo.local/docs", URLPath: "/docs", Metadata: `{"duration_ms":15000}`, CreatedAt: base.Add(15 * time.Second)},
+	} {
+		if err := app.writeEventImmediately(item); err != nil {
+			t.Fatalf("seed public share dwell event: %v", err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/public/shares/demo-share?from=2026-05-01&to=2026-05-01", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var payload struct {
+		Overview struct {
+			AvgTimeOnPage int64 `json:"avg_time_on_page_seconds"`
+		} `json:"overview"`
+		Pages []struct {
+			Label         string `json:"label"`
+			AvgTimeOnPage int64  `json:"avg_time_on_page_seconds"`
+		} `json:"pages"`
+	}
+	decodeTestJSON(t, rec.Body.Bytes(), &payload)
+	if payload.Overview.AvgTimeOnPage != 15 {
+		t.Fatalf("expected public share avg time on page 15, got %#v", payload.Overview)
+	}
+	if len(payload.Pages) != 1 || payload.Pages[0].Label != "/docs" || payload.Pages[0].AvgTimeOnPage != 15 {
+		t.Fatalf("expected public share page dwell metric, got %#v", payload.Pages)
 	}
 }
 
@@ -588,6 +830,31 @@ func TestWebsitePermissionGuards(t *testing.T) {
 	})
 }
 
+func TestDisableUserRevokesSessionsImmediately(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.routes()
+	websiteID := seedWebsite(t, app, "Demo", "demo.local")
+	adminID, adminToken := seedUser(t, app, "owner", roleSuperAdmin, nil)
+	userID, userToken := seedUser(t, app, "analyst", roleAnalyst, []WebsitePermission{{WebsiteID: websiteID, AccessLevel: "view"}})
+	_, _ = adminID, userID
+
+	req := authedJSONRequest(t, http.MethodPut, "/api/users/"+userID, map[string]any{
+		"enabled": false,
+	}, adminToken)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 when disabling user, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	protectedReq := authedJSONRequest(t, http.MethodGet, "/api/websites", nil, userToken)
+	protectedRec := httptest.NewRecorder()
+	handler.ServeHTTP(protectedRec, protectedReq)
+	if protectedRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected disabled user session to be revoked, got %d: %s", protectedRec.Code, protectedRec.Body.String())
+	}
+}
+
 func TestRunFunnelCalculatesConversionAndDropOff(t *testing.T) {
 	app := newTestApp(t)
 	websiteID := seedWebsite(t, app, "Demo", "demo.local")
@@ -603,7 +870,7 @@ func TestRunFunnelCalculatesConversionAndDropOff(t *testing.T) {
 			}
 			base = base.Add(1 * time.Minute)
 		}
-		base = base.Add(31 * time.Minute)
+		base = base.Add(35 * time.Minute)
 	}
 
 	seedFunnelSession("visitor-a", []queuedEvent{

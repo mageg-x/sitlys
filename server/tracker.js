@@ -58,15 +58,81 @@
   };
 
   var lastURL = window.location.href;
+  var lastPageviewAt = 0;
+  var leaveSentForURL = "";
+  var heartbeatId = 0;
+  var lastHeartbeatAt = 0;
+  var HEARTBEAT_MS = 30000;
+
+  function resetHeartbeat() {
+    if (heartbeatId) {
+      window.clearInterval(heartbeatId);
+      heartbeatId = 0;
+    }
+    lastHeartbeatAt = Date.now();
+    heartbeatId = window.setInterval(function () {
+      if (document.visibilityState === "hidden" || !lastPageviewAt) return;
+      var now = Date.now();
+      var delta = Math.max(0, now - lastHeartbeatAt);
+      if (!delta) return;
+      lastHeartbeatAt = now;
+      collect("event", basePayload({
+        url: lastURL,
+        hostname: new URL(lastURL, window.location.href).hostname,
+        name: "page_ping",
+        data: {
+          duration_ms: delta
+        }
+      }));
+    }, HEARTBEAT_MS);
+  }
+
+  function trackPageLeave(forceURL) {
+    var currentURL = forceURL || lastURL || window.location.href;
+    if (!lastPageviewAt || leaveSentForURL === currentURL) return;
+    leaveSentForURL = currentURL;
+    if (heartbeatId) {
+      window.clearInterval(heartbeatId);
+      heartbeatId = 0;
+    }
+    collect("event", basePayload({
+      url: currentURL,
+      hostname: new URL(currentURL, window.location.href).hostname,
+      name: "page_leave",
+      data: {
+        duration_ms: Math.max(0, Date.now() - lastPageviewAt)
+      }
+    }));
+  }
+
+  function shouldTrackPageview() {
+    if (document.visibilityState === "hidden") return false;
+    if (navigator.doNotTrack === "1" || window.doNotTrack === "1" || navigator.msDoNotTrack === "1") {
+      return false;
+    }
+    return true;
+  }
 
   function trackPageviewIfChanged() {
     var nextURL = window.location.href;
     if (nextURL === lastURL) return;
+    trackPageLeave(lastURL);
     lastURL = nextURL;
+    if (!shouldTrackPageview()) return;
+    lastPageviewAt = Date.now();
+    lastHeartbeatAt = lastPageviewAt;
+    leaveSentForURL = "";
+    resetHeartbeat();
     collect("pageview", basePayload());
   }
 
-  collect("pageview", basePayload());
+  if (shouldTrackPageview()) {
+    lastPageviewAt = Date.now();
+    lastHeartbeatAt = lastPageviewAt;
+    leaveSentForURL = "";
+    resetHeartbeat();
+    collect("pageview", basePayload());
+  }
 
   window.addEventListener("hashchange", trackPageviewIfChanged);
   window.addEventListener("popstate", trackPageviewIfChanged);
@@ -79,11 +145,21 @@
     };
   }
 
-  var originalReplaceState = window.history && window.history.replaceState;
-  if (originalReplaceState) {
-    window.history.replaceState = function () {
-      originalReplaceState.apply(window.history, arguments);
+  window.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "hidden") {
+      trackPageLeave();
+      return;
+    }
+    if (document.visibilityState === "visible") {
       trackPageviewIfChanged();
-    };
-  }
+    }
+  });
+
+  window.addEventListener("pagehide", function () {
+    trackPageLeave();
+  });
+
+  window.addEventListener("beforeunload", function () {
+    trackPageLeave();
+  });
 })();

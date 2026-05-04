@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"math"
 	"net/http"
 	"net/url"
 	"path"
@@ -464,6 +465,12 @@ func (a *App) handleUserByID(w http.ResponseWriter, r *http.Request) {
 			errorResponse(w, http.StatusBadRequest, "update user failed")
 			return
 		}
+		if req.Enabled != nil && !*req.Enabled {
+			if _, err := tx.Exec(`delete from auth_sessions where user_id = ?`, userID); err != nil {
+				errorResponse(w, http.StatusInternalServerError, "revoke user sessions failed")
+				return
+			}
+		}
 	}
 	if req.Permissions != nil {
 		if err := upsertPermissions(tx, userID, req.Permissions); err != nil {
@@ -541,7 +548,7 @@ func (a *App) handleWebsites(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.Name = strings.TrimSpace(req.Name)
-		req.Domain = strings.TrimSpace(req.Domain)
+		req.Domain = normalizeWebsiteDomain(req.Domain)
 		if req.Name == "" || req.Domain == "" {
 			errorResponse(w, http.StatusBadRequest, "name and domain required")
 			return
@@ -601,7 +608,9 @@ func (a *App) handleWebsiteByID(w http.ResponseWriter, r *http.Request) {
 			errorResponse(w, http.StatusBadRequest, "invalid request body")
 			return
 		}
-		if strings.TrimSpace(req.Name) == "" || strings.TrimSpace(req.Domain) == "" {
+		name := strings.TrimSpace(req.Name)
+		domain := normalizeWebsiteDomain(req.Domain)
+		if name == "" || domain == "" {
 			errorResponse(w, http.StatusBadRequest, "name and domain required")
 			return
 		}
@@ -609,7 +618,7 @@ func (a *App) handleWebsiteByID(w http.ResponseWriter, r *http.Request) {
 			update websites
 			set name = ?, domain = ?, updated_at = ?
 			where id = ?
-		`, strings.TrimSpace(req.Name), strings.TrimSpace(req.Domain), iso(nowUTC()), websiteID)
+		`, name, domain, iso(nowUTC()), websiteID)
 		if err != nil {
 			errorResponse(w, http.StatusInternalServerError, "update website failed")
 			return
@@ -980,21 +989,15 @@ func (a *App) handleBatch(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	websiteCounts := make(map[string]int)
+	results := make([]map[string]any, 0, len(reqs))
+	limitedCount := 0
 	for _, req := range reqs {
 		websiteID := strings.TrimSpace(firstNonEmpty(req.Payload.Website, a.websiteForPixel(strings.TrimSpace(req.Payload.Pixel))))
-		if websiteID != "" {
-			websiteCounts[websiteID]++
+		if websiteID != "" && !a.allowCollectionRequest(r, websiteID, 1) {
+			results = append(results, map[string]any{"ok": false, "error": "rate limit exceeded", "website_id": websiteID})
+			limitedCount++
+			continue
 		}
-	}
-	for websiteID, count := range websiteCounts {
-		if !a.allowCollectionRequest(r, websiteID, count) {
-			errorResponse(w, http.StatusTooManyRequests, "rate limit exceeded")
-			return
-		}
-	}
-	results := make([]map[string]any, 0, len(reqs))
-	for _, req := range reqs {
 		res, err := a.recordEvent(r, req)
 		if err != nil {
 			results = append(results, map[string]any{"ok": false, "error": err.Error()})
@@ -1002,7 +1005,11 @@ func (a *App) handleBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		results = append(results, map[string]any{"ok": true, "result": res})
 	}
-	jsonResponse(w, http.StatusOK, map[string]any{"ok": true, "items": results})
+	status := http.StatusOK
+	if limitedCount > 0 && limitedCount == len(reqs) {
+		status = http.StatusTooManyRequests
+	}
+	jsonResponse(w, status, map[string]any{"ok": true, "items": results, "partial": limitedCount > 0})
 }
 
 func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) {
@@ -1155,6 +1162,9 @@ func (a *App) recordEvent(r *http.Request, req eventRequest) (map[string]any, er
 		fullURL = "https://" + strings.TrimPrefix(fullURL, "/")
 	}
 	parsedURL, host, pathValue := cleanURL(fullURL)
+	if !a.websiteAllowsHost(websiteID, firstNonEmpty(payload.Hostname, host)) {
+		return nil, fmt.Errorf("website domain mismatch")
+	}
 	refDomain := referrerDomain(payload.Referrer)
 	browser, osName, device := detectUserAgent(r, payload)
 	country, region, city := detectGeo(r, payload)
@@ -1243,6 +1253,18 @@ func (a *App) websiteExists(websiteID string) bool {
 	return count > 0
 }
 
+func (a *App) websiteAllowsHost(websiteID, host string) bool {
+	host = normalizeWebsiteDomain(host)
+	if host == "" {
+		return false
+	}
+	var configuredDomain string
+	if err := a.db.QueryRow(`select domain from websites where id = ?`, websiteID).Scan(&configuredDomain); err != nil {
+		return false
+	}
+	return hostMatchesWebsiteDomain(host, configuredDomain)
+}
+
 func (a *App) websiteForPixel(pixelID string) string {
 	if pixelID == "" {
 		return ""
@@ -1306,11 +1328,14 @@ func (a *App) handleOverview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type overview struct {
-		Pageviews int64   `json:"pageviews"`
-		Visitors  int64   `json:"visitors"`
-		Sessions  int64   `json:"sessions"`
-		Events    int64   `json:"events"`
-		Revenue   float64 `json:"revenue"`
+		Pageviews          int64   `json:"pageviews"`
+		Visitors           int64   `json:"visitors"`
+		Sessions           int64   `json:"sessions"`
+		Events             int64   `json:"events"`
+		Revenue            float64 `json:"revenue"`
+		BounceRate         float64 `json:"bounce_rate"`
+		AvgSessionDuration int64   `json:"avg_session_duration_seconds"`
+		AvgTimeOnPage      int64   `json:"avg_time_on_page_seconds"`
 	}
 	var out overview
 	var customEvents int64
@@ -1318,27 +1343,45 @@ func (a *App) handleOverview(w http.ResponseWriter, r *http.Request) {
 		select
 			coalesce(sum(pageviews), 0),
 			coalesce(sum(custom_events), 0),
+			coalesce(sum(visitors), 0),
+			coalesce(sum(sessions), 0),
 			coalesce(sum(revenue), 0)
 		from agg_overview_daily
 		where website_id = ? and bucket_date between ? and ?
-	`, websiteID, from.Format("2006-01-02"), to.Format("2006-01-02")).Scan(&out.Pageviews, &customEvents, &out.Revenue); err != nil {
+	`, websiteID, from.Format("2006-01-02"), to.Format("2006-01-02")).Scan(&out.Pageviews, &customEvents, &out.Visitors, &out.Sessions, &out.Revenue); err != nil {
 		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	out.Events = out.Pageviews + customEvents
 	if err := a.db.QueryRow(`
-		select count(distinct visitor_id), count(*)
+		select
+			coalesce(avg(case when pageviews = 1 then 1.0 else 0.0 end), 0),
+			coalesce(avg(max(0, unixepoch(last_seen_at) - unixepoch(started_at))), 0)
 		from sessions
 		where website_id = ? and started_at between ? and ?
-	`, websiteID, iso(from), iso(to)).Scan(&out.Visitors, &out.Sessions); err != nil {
+	`, websiteID, iso(from), iso(to)).Scan(&out.BounceRate, &out.AvgSessionDuration); err != nil {
 		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	out.AvgTimeOnPage = a.queryAverageTimeOnPageSeconds(websiteID, from, to)
 	trendRows, err := a.db.Query(`
-		select bucket_date, pageviews, custom_events, revenue
+		select
+			o.bucket_date,
+			o.pageviews,
+			o.custom_events,
+			o.visitors,
+			o.sessions,
+			o.revenue,
+			coalesce(avg(cast(json_extract(e.metadata, '$.duration_ms') as integer) / 1000), 0) as avg_time_on_page_seconds
 		from agg_overview_daily
-		where website_id = ? and bucket_date between ? and ?
-		order by bucket_date asc
+		o
+		left join events e
+			on e.website_id = o.website_id
+			and e.event_name in ('page_leave', 'page_ping')
+			and date(e.created_at) = o.bucket_date
+		where o.website_id = ? and o.bucket_date between ? and ?
+		group by o.bucket_date, o.pageviews, o.custom_events, o.visitors, o.sessions, o.revenue
+		order by o.bucket_date asc
 	`, websiteID, from.Format("2006-01-02"), to.Format("2006-01-02"))
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, err.Error())
@@ -1348,17 +1391,21 @@ func (a *App) handleOverview(w http.ResponseWriter, r *http.Request) {
 	var trend []map[string]any
 	for trendRows.Next() {
 		var day string
-		var pageviews, customEvents int64
+		var pageviews, customEvents, visitors, sessions int64
+		var avgTimeOnPage float64
 		var revenue float64
-		if err := trendRows.Scan(&day, &pageviews, &customEvents, &revenue); err != nil {
+		if err := trendRows.Scan(&day, &pageviews, &customEvents, &visitors, &sessions, &revenue, &avgTimeOnPage); err != nil {
 			errorResponse(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		trend = append(trend, map[string]any{
-			"date":      day,
-			"pageviews": pageviews,
-			"events":    pageviews + customEvents,
-			"revenue":   revenue,
+			"date":                     day,
+			"pageviews":                pageviews,
+			"visitors":                 visitors,
+			"sessions":                 sessions,
+			"events":                   pageviews + customEvents,
+			"revenue":                  revenue,
+			"avg_time_on_page_seconds": int64(math.Round(avgTimeOnPage)),
 		})
 	}
 	compare, _ := a.loadOverviewCompare(websiteID, from, to)
@@ -1395,6 +1442,11 @@ func (a *App) handlePages(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	dwellByPath, err := a.queryPageDwellMetrics(websiteID, from, to)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	rows, err := a.db.Query(`
 		select url_path, sum(pageviews) as pageviews
 		from agg_pages_daily
@@ -1416,10 +1468,17 @@ func (a *App) handlePages(w http.ResponseWriter, r *http.Request) {
 			errorResponse(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		dwell := dwellByPath[path]
+		avgDwell := int64(0)
+		if dwell.Count > 0 {
+			avgDwell = dwell.DurationMS / dwell.Count / 1000
+		}
 		items = append(items, map[string]any{
-			"path":      path,
-			"pageviews": pageviews,
-			"sessions":  sessionCounts[path],
+			"path":                       path,
+			"pageviews":                  pageviews,
+			"sessions":                   sessionCounts[path],
+			"avg_time_on_page_seconds":   avgDwell,
+			"time_on_page_sample_count":  dwell.Count,
 		})
 	}
 	entryRows, err := a.db.Query(`
@@ -2011,6 +2070,8 @@ func (a *App) handleExport(w http.ResponseWriter, r *http.Request) {
 	switch kind {
 	case "events":
 		a.exportEvents(w, r, websiteID, from, to, format)
+	case "pages":
+		a.exportPages(w, r, websiteID, from, to, format)
 	case "sessions":
 		a.exportSessions(w, r, websiteID, from, to, format)
 	default:
@@ -2020,7 +2081,7 @@ func (a *App) handleExport(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) exportEvents(w http.ResponseWriter, _ *http.Request, websiteID string, from, to time.Time, format string) {
 	rows, err := a.db.Query(`
-		select created_at, event_type, event_name, url_path, referrer_domain, browser, os, device, country, region, city, amount, currency
+		select created_at, event_type, event_name, url_path, referrer_domain, browser, os, device, country, region, city, amount, currency, coalesce(cast(json_extract(metadata, '$.duration_ms') as integer), 0) as duration_ms
 		from events
 		where website_id = ? and created_at between ? and ?
 		order by created_at asc
@@ -2032,17 +2093,18 @@ func (a *App) exportEvents(w http.ResponseWriter, _ *http.Request, websiteID str
 	}
 	defer rows.Close()
 
-	headers := []string{"created_at", "event_type", "event_name", "url_path", "referrer_domain", "browser", "os", "device", "country", "region", "city", "amount", "currency"}
+	headers := []string{"created_at", "event_type", "event_name", "url_path", "referrer_domain", "browser", "os", "device", "country", "region", "city", "amount", "currency", "duration_ms"}
 	var records [][]string
 	for rows.Next() {
 		var createdAt, eventType, eventName, urlPath, referrer, browser, osName, device, country, region, city, currency string
 		var amount float64
-		if err := rows.Scan(&createdAt, &eventType, &eventName, &urlPath, &referrer, &browser, &osName, &device, &country, &region, &city, &amount, &currency); err != nil {
+		var durationMS int64
+		if err := rows.Scan(&createdAt, &eventType, &eventName, &urlPath, &referrer, &browser, &osName, &device, &country, &region, &city, &amount, &currency, &durationMS); err != nil {
 			errorResponse(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		records = append(records, []string{
-			createdAt, eventType, eventName, urlPath, referrer, browser, osName, device, country, region, city, fmt.Sprintf("%.2f", amount), currency,
+			createdAt, eventType, eventName, urlPath, referrer, browser, osName, device, country, region, city, fmt.Sprintf("%.2f", amount), currency, strconv.FormatInt(durationMS, 10),
 		})
 	}
 	writeExport(w, format, "events", headers, records)
@@ -2076,6 +2138,54 @@ func (a *App) exportSessions(w http.ResponseWriter, _ *http.Request, websiteID s
 		})
 	}
 	writeExport(w, format, "sessions", headers, records)
+}
+
+func (a *App) exportPages(w http.ResponseWriter, _ *http.Request, websiteID string, from, to time.Time, format string) {
+	dwellByPath, err := a.queryPageDwellMetrics(websiteID, from, to)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	rows, err := a.db.Query(`
+		select
+			e.url_path,
+			count(*) as pageviews,
+			count(distinct e.session_id) as sessions
+		from events e
+		where e.website_id = ? and e.event_type = 'pageview' and e.created_at between ? and ?
+		group by e.url_path
+		order by pageviews desc, e.url_path asc
+		limit 20000
+	`, websiteID, iso(from), iso(to))
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
+	headers := []string{"path", "pageviews", "sessions", "avg_time_on_page_seconds", "time_on_page_sample_count"}
+	var records [][]string
+	for rows.Next() {
+		var path string
+		var pageviews, sessions int64
+		if err := rows.Scan(&path, &pageviews, &sessions); err != nil {
+			errorResponse(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		dwell := dwellByPath[path]
+		avgSeconds := int64(0)
+		if dwell.Count > 0 {
+			avgSeconds = dwell.DurationMS / dwell.Count / 1000
+		}
+		records = append(records, []string{
+			path,
+			strconv.FormatInt(pageviews, 10),
+			strconv.FormatInt(sessions, 10),
+			strconv.FormatInt(avgSeconds, 10),
+			strconv.FormatInt(dwell.Count, 10),
+		})
+	}
+	writeExport(w, format, "pages", headers, records)
 }
 
 func writeExport(w http.ResponseWriter, format, name string, headers []string, records [][]string) {
@@ -2118,44 +2228,53 @@ func (a *App) loadOverviewCompare(websiteID string, from, to time.Time) (map[str
 	prevFrom := prevTo.Add(-duration)
 
 	type overview struct {
-		Pageviews int64
-		Visitors  int64
-		Sessions  int64
-		Events    int64
-		Revenue   float64
+		Pageviews          int64
+		Visitors           int64
+		Sessions           int64
+		Events             int64
+		Revenue            float64
+		BounceRate         float64
+		AvgSessionDuration int64
+		AvgTimeOnPage      int64
 	}
 	var current, previous overview
 	var currentCustomEvents, previousCustomEvents int64
 	if err := a.db.QueryRow(`
-		select coalesce(sum(pageviews), 0), coalesce(sum(custom_events), 0), coalesce(sum(revenue), 0)
+		select coalesce(sum(pageviews), 0), coalesce(sum(custom_events), 0), coalesce(sum(visitors), 0), coalesce(sum(sessions), 0), coalesce(sum(revenue), 0)
 		from agg_overview_daily
 		where website_id = ? and bucket_date between ? and ?
-	`, websiteID, from.Format("2006-01-02"), to.Format("2006-01-02")).Scan(&current.Pageviews, &currentCustomEvents, &current.Revenue); err != nil {
+	`, websiteID, from.Format("2006-01-02"), to.Format("2006-01-02")).Scan(&current.Pageviews, &currentCustomEvents, &current.Visitors, &current.Sessions, &current.Revenue); err != nil {
 		return nil, err
 	}
 	current.Events = current.Pageviews + currentCustomEvents
 	if err := a.db.QueryRow(`
-		select count(distinct visitor_id), count(*)
+		select
+			coalesce(avg(case when pageviews = 1 then 1.0 else 0.0 end), 0),
+			coalesce(avg(max(0, unixepoch(last_seen_at) - unixepoch(started_at))), 0)
 		from sessions
 		where website_id = ? and started_at between ? and ?
-	`, websiteID, iso(from), iso(to)).Scan(&current.Visitors, &current.Sessions); err != nil {
+	`, websiteID, iso(from), iso(to)).Scan(&current.BounceRate, &current.AvgSessionDuration); err != nil {
 		return nil, err
 	}
+	current.AvgTimeOnPage = a.queryAverageTimeOnPageSeconds(websiteID, from, to)
 	if err := a.db.QueryRow(`
-		select coalesce(sum(pageviews), 0), coalesce(sum(custom_events), 0), coalesce(sum(revenue), 0)
+		select coalesce(sum(pageviews), 0), coalesce(sum(custom_events), 0), coalesce(sum(visitors), 0), coalesce(sum(sessions), 0), coalesce(sum(revenue), 0)
 		from agg_overview_daily
 		where website_id = ? and bucket_date between ? and ?
-	`, websiteID, prevFrom.Format("2006-01-02"), prevTo.Format("2006-01-02")).Scan(&previous.Pageviews, &previousCustomEvents, &previous.Revenue); err != nil {
+	`, websiteID, prevFrom.Format("2006-01-02"), prevTo.Format("2006-01-02")).Scan(&previous.Pageviews, &previousCustomEvents, &previous.Visitors, &previous.Sessions, &previous.Revenue); err != nil {
 		return nil, err
 	}
 	previous.Events = previous.Pageviews + previousCustomEvents
 	if err := a.db.QueryRow(`
-		select count(distinct visitor_id), count(*)
+		select
+			coalesce(avg(case when pageviews = 1 then 1.0 else 0.0 end), 0),
+			coalesce(avg(max(0, unixepoch(last_seen_at) - unixepoch(started_at))), 0)
 		from sessions
 		where website_id = ? and started_at between ? and ?
-	`, websiteID, iso(prevFrom), iso(prevTo)).Scan(&previous.Visitors, &previous.Sessions); err != nil {
+	`, websiteID, iso(prevFrom), iso(prevTo)).Scan(&previous.BounceRate, &previous.AvgSessionDuration); err != nil {
 		return nil, err
 	}
+	previous.AvgTimeOnPage = a.queryAverageTimeOnPageSeconds(websiteID, prevFrom, prevTo)
 
 	return map[string]any{
 		"from": iso(prevFrom),
@@ -2166,6 +2285,24 @@ func (a *App) loadOverviewCompare(websiteID string, from, to time.Time) (map[str
 			"sessions":  metricDelta(current.Sessions, previous.Sessions),
 			"events":    metricDelta(current.Events, previous.Events),
 			"revenue":   metricDeltaFloat(current.Revenue, previous.Revenue),
+			"bounce_rate": map[string]any{
+				"current":     current.BounceRate,
+				"previous":    previous.BounceRate,
+				"change":      current.BounceRate - previous.BounceRate,
+				"change_rate": 0.0,
+			},
+			"avg_session_duration_seconds": map[string]any{
+				"current":     current.AvgSessionDuration,
+				"previous":    previous.AvgSessionDuration,
+				"change":      current.AvgSessionDuration - previous.AvgSessionDuration,
+				"change_rate": 0.0,
+			},
+			"avg_time_on_page_seconds": map[string]any{
+				"current":     current.AvgTimeOnPage,
+				"previous":    previous.AvgTimeOnPage,
+				"change":      current.AvgTimeOnPage - previous.AvgTimeOnPage,
+				"change_rate": 0.0,
+			},
 		},
 	}, nil
 }
@@ -2313,7 +2450,7 @@ func matchesStep(step FunnelStep, item struct {
 }) bool {
 	switch step.Type {
 	case "page":
-		return pathMatchesStepValue(item.Path, step.Value)
+		return item.Type == "pageview" && pathMatchesStepValue(item.Path, step.Value)
 	case "event":
 		return strings.EqualFold(strings.TrimSpace(item.Name), strings.TrimSpace(step.Value))
 	default:
@@ -2369,14 +2506,7 @@ func (a *App) handlePublicShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	overview := a.publicOverview(share.WebsiteID, from, to)
-	pages := a.queryGroupedItems(`
-		select url_path as label, count(*) as count
-		from events
-		where website_id = ? and event_type = 'pageview' and created_at between ? and ?
-		group by url_path
-		order by count desc, label asc
-		limit 20
-	`, share.WebsiteID, from, to)
+	pages := a.queryPublicPages(share.WebsiteID, from, to)
 	referrers := a.queryGroupedItems(`
 		select case when referrer_domain = '' then '(direct)' else referrer_domain end as label, count(*) as count
 		from sessions
@@ -2400,11 +2530,12 @@ func (a *App) handlePublicShare(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) publicOverview(websiteID string, from, to time.Time) map[string]any {
 	type overview struct {
-		Pageviews int64   `json:"pageviews"`
-		Visitors  int64   `json:"visitors"`
-		Sessions  int64   `json:"sessions"`
-		Events    int64   `json:"events"`
-		Revenue   float64 `json:"revenue"`
+		Pageviews     int64   `json:"pageviews"`
+		Visitors      int64   `json:"visitors"`
+		Sessions      int64   `json:"sessions"`
+		Events        int64   `json:"events"`
+		Revenue       float64 `json:"revenue"`
+		AvgTimeOnPage int64   `json:"avg_time_on_page_seconds"`
 	}
 	var out overview
 	_ = a.db.QueryRow(`
@@ -2417,13 +2548,64 @@ func (a *App) publicOverview(websiteID string, from, to time.Time) map[string]an
 		from events
 		where website_id = ? and created_at between ? and ?
 	`, websiteID, iso(from), iso(to)).Scan(&out.Pageviews, &out.Visitors, &out.Sessions, &out.Events, &out.Revenue)
+	out.AvgTimeOnPage = a.queryAverageTimeOnPageSeconds(websiteID, from, to)
 	return map[string]any{
-		"pageviews": out.Pageviews,
-		"visitors":  out.Visitors,
-		"sessions":  out.Sessions,
-		"events":    out.Events,
-		"revenue":   out.Revenue,
+		"pageviews":                out.Pageviews,
+		"visitors":                 out.Visitors,
+		"sessions":                 out.Sessions,
+		"events":                   out.Events,
+		"revenue":                  out.Revenue,
+		"avg_time_on_page_seconds": out.AvgTimeOnPage,
 	}
+}
+
+type pageDwellMetric struct {
+	DurationMS int64
+	Count      int64
+}
+
+func (a *App) queryPageDwellMetrics(websiteID string, from, to time.Time) (map[string]pageDwellMetric, error) {
+	rows, err := a.db.Query(`
+		select
+			url_path,
+			coalesce(sum(cast(json_extract(metadata, '$.duration_ms') as integer)), 0) as duration_ms,
+			count(*) as samples
+		from events
+		where website_id = ?
+			and event_name in ('page_leave', 'page_ping')
+			and created_at between ? and ?
+			and trim(url_path) <> ''
+		group by url_path
+	`, websiteID, iso(from), iso(to))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string]pageDwellMetric{}
+	for rows.Next() {
+		var path string
+		var durationMS, samples int64
+		if err := rows.Scan(&path, &durationMS, &samples); err != nil {
+			return nil, err
+		}
+		out[path] = pageDwellMetric{DurationMS: durationMS, Count: samples}
+	}
+	return out, rows.Err()
+}
+
+func (a *App) queryAverageTimeOnPageSeconds(websiteID string, from, to time.Time) int64 {
+	var avgSeconds float64
+	if err := a.db.QueryRow(`
+		select coalesce(avg(cast(json_extract(metadata, '$.duration_ms') as integer) / 1000), 0)
+		from events
+		where website_id = ?
+			and event_name in ('page_leave', 'page_ping')
+			and created_at between ? and ?
+	`, websiteID, iso(from), iso(to)).Scan(&avgSeconds); err != nil {
+		return 0
+	}
+	return int64(math.Round(avgSeconds))
 }
 
 func (a *App) queryPublicAttributionItems(websiteID string, from, to time.Time) []map[string]any {
@@ -2488,6 +2670,44 @@ func (a *App) queryRevenueItems(websiteID string, from, to time.Time) []map[stri
 		var revenue float64
 		if err := rows.Scan(&currency, &revenue); err == nil {
 			items = append(items, map[string]any{"currency": currency, "revenue": revenue})
+		}
+	}
+	return items
+}
+
+func (a *App) queryPublicPages(websiteID string, from, to time.Time) []map[string]any {
+	dwellByPath, err := a.queryPageDwellMetrics(websiteID, from, to)
+	if err != nil {
+		return nil
+	}
+	rows, err := a.db.Query(`
+		select url_path, count(*) as count
+		from events
+		where website_id = ? and event_type = 'pageview' and created_at between ? and ?
+		group by url_path
+		order by count desc, url_path asc
+		limit 20
+	`, websiteID, iso(from), iso(to))
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var items []map[string]any
+	for rows.Next() {
+		var path string
+		var count int64
+		if err := rows.Scan(&path, &count); err == nil {
+			dwell := dwellByPath[path]
+			avgSeconds := int64(0)
+			if dwell.Count > 0 {
+				avgSeconds = dwell.DurationMS / dwell.Count / 1000
+			}
+			items = append(items, map[string]any{
+				"label":                    path,
+				"count":                    count,
+				"avg_time_on_page_seconds": avgSeconds,
+			})
 		}
 	}
 	return items

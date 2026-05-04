@@ -223,7 +223,11 @@ export function createAdminActions(ctx) {
       return;
     }
     const url = `/api/analytics/export?website_id=${encodeURIComponent(state.websiteId)}&from=${state.from}&to=${state.to}&kind=${encodeURIComponent(kind)}&format=${encodeURIComponent(format)}`;
-    const response = await fetch(url, { credentials: "include" });
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 15000);
+    const response = await fetch(url, { credentials: "include", signal: controller.signal }).finally(() => {
+      window.clearTimeout(timer);
+    });
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
       throw new Error(data.error || t("requestFailed"));

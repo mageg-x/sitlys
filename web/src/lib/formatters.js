@@ -1,7 +1,10 @@
 export function dateOffset(diff) {
   const value = new Date();
   value.setDate(value.getDate() + diff);
-  return value.toISOString().slice(0, 10);
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+  const day = String(value.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 export function formatNumber(value) {
@@ -14,9 +17,28 @@ export function formatPercent(value) {
 
 export function formatMoney(value, currency = "") {
   const normalized = String(currency || "").trim().toUpperCase();
-  const amount = Number(value || 0).toFixed(2);
   if (!normalized || normalized === "N/A") {
-    return amount;
+    return Number(value || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
-  return `${normalized} ${amount}`;
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: "currency",
+      currency: normalized,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(Number(value || 0));
+  } catch {
+    const amount = Number(value || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return `${normalized} ${amount}`;
+  }
+}
+
+export function formatDurationSeconds(value) {
+  const total = Math.max(0, Math.round(Number(value || 0)));
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  if (!minutes) {
+    return `${seconds}s`;
+  }
+  return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
 }
