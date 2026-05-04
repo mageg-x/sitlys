@@ -324,11 +324,21 @@ export function createAppController({ t, localeRef }) {
       String(item.campaign || "").toLowerCase().includes(query)
     );
   });
+  function peakTrendValue(key) {
+    let max = 1;
+    for (const item of state.overviewTrend) {
+      const value = Number(item?.[key] || 0);
+      if (value > max) {
+        max = value;
+      }
+    }
+    return max;
+  }
   const overviewTrendPeaks = computed(() => ({
-    pageviews: Math.max(...state.overviewTrend.map(item => Number(item.pageviews || 0)), 1),
-    events: Math.max(...state.overviewTrend.map(item => Number(item.events || 0)), 1),
-    revenue: Math.max(...state.overviewTrend.map(item => Number(item.revenue || 0)), 1),
-    avgTimeOnPage: Math.max(...state.overviewTrend.map(item => Number(item.avg_time_on_page_seconds || 0)), 1),
+    pageviews: peakTrendValue("pageviews"),
+    events: peakTrendValue("events"),
+    revenue: peakTrendValue("revenue"),
+    avgTimeOnPage: peakTrendValue("avg_time_on_page_seconds"),
   }));
 
   const overviewHighlights = computed(() => {
@@ -943,6 +953,7 @@ export function createAppController({ t, localeRef }) {
     handleWebsiteChange: routeActions.handleWebsiteChange,
     applyRange: routeActions.applyRange,
     refreshActive: analyticsActions.refreshActive,
+    loadRealtime: analyticsActions.loadRealtime,
     selectRoute: routeActions.selectRoute,
     loadPublicShare: analyticsActions.loadPublicShare,
     saveWebsite: adminActions.saveWebsite,

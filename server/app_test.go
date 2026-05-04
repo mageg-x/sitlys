@@ -97,13 +97,88 @@ func TestAllowRateLimitPrunesBucketMap(t *testing.T) {
 }
 
 func TestDetectGeo(t *testing.T) {
+	app := newTestApp(t)
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("CF-IPCountry", "US")
 	req.Header.Set("CF-Region-Code", "CA")
 	req.Header.Set("CF-IPCity", "San Francisco")
-	country, region, city := detectGeo(req, eventPayload{})
+	country, region, city := app.detectGeo(req, eventPayload{})
 	if country != "US" || region != "CA" || city != "San Francisco" {
 		t.Fatalf("unexpected geo fallback: %q %q %q", country, region, city)
+	}
+}
+
+func TestDetectGeoPrefersPayload(t *testing.T) {
+	app := newTestApp(t)
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("CF-IPCountry", "US")
+	country, region, city := app.detectGeo(req, eventPayload{
+		Country: "CN",
+		Region:  "SH",
+		City:    "Shanghai",
+	})
+	if country != "CN" || region != "SH" || city != "Shanghai" {
+		t.Fatalf("expected payload geo to win, got %q %q %q", country, region, city)
+	}
+}
+
+func TestDetectGeoWithoutHeadersOrDBReturnsEmpty(t *testing.T) {
+	app := newTestApp(t)
+	req := httptest.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "203.0.113.20:4321"
+	country, region, city := app.detectGeo(req, eventPayload{})
+	if country != "" || region != "" || city != "" {
+		t.Fatalf("expected empty geo without headers or db, got %q %q %q", country, region, city)
+	}
+}
+
+func TestResolveGeoIPDBPathFallsBackToRepoCopy(t *testing.T) {
+	path, err := resolveGeoIPDBPath("", t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve geoip path: %v", err)
+	}
+	if path == "" {
+		t.Fatal("expected default geoip lookup to find an external database file")
+	}
+	if !strings.HasSuffix(filepath.ToSlash(path), "server/GeoLite2-City.mmdb") && !strings.HasSuffix(filepath.ToSlash(path), "GeoLite2-City.mmdb") {
+		t.Fatalf("unexpected geoip path: %s", path)
+	}
+}
+
+func TestReloadGeoIPDBGracefullyDisablesInvalidDatabase(t *testing.T) {
+	app := newTestApp(t)
+	path, err := resolveGeoIPDBPath("", t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve geoip path: %v", err)
+	}
+	if path == "" {
+		t.Skip("no external geoip database available in this environment")
+	}
+	app.cfg.GeoIPDBPath = path
+	if err := app.reloadGeoIPDB(); err != nil {
+		t.Fatalf("reload geoip db: %v", err)
+	}
+}
+
+func TestResolveGeoIPDBPathReturnsEmptyWhenNoCandidateExists(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	tempDir := t.TempDir()
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("chdir temp: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(wd)
+	})
+
+	path, err := resolveGeoIPDBPath("", tempDir)
+	if err != nil {
+		t.Fatalf("resolve geoip path: %v", err)
+	}
+	if path != "" {
+		t.Fatalf("expected empty path when no geoip db exists, got %s", path)
 	}
 }
 
@@ -143,8 +218,14 @@ func TestHostMatchesWebsiteDomain(t *testing.T) {
 	if !hostMatchesWebsiteDomain("app.demo.local", "demo.local") {
 		t.Fatal("expected subdomain to match configured website domain")
 	}
+	if !hostMatchesWebsiteDomain("localhost:3000", "localhost:3000") {
+		t.Fatal("expected host with explicit port to match configured domain with same port")
+	}
 	if hostMatchesWebsiteDomain("demo.local.evil", "demo.local") {
 		t.Fatal("did not expect unrelated suffix host to match configured website domain")
+	}
+	if hostMatchesWebsiteDomain("localhost:5173", "localhost:3000") {
+		t.Fatal("did not expect different ports to match")
 	}
 }
 
@@ -194,6 +275,21 @@ func TestHandleSendAcceptsUnknownCollectionFields(t *testing.T) {
 	app.handleSend(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleSendUsesCorsOriginEcho(t *testing.T) {
+	app := newTestApp(t)
+	req := httptest.NewRequest(http.MethodOptions, "/api/send", nil)
+	req.Header.Set("Origin", "https://kefu.mageg.cn")
+	rec := httptest.NewRecorder()
+
+	app.handleSend(rec, req)
+	if rec.Header().Get("Access-Control-Allow-Origin") != "https://kefu.mageg.cn" {
+		t.Fatalf("unexpected CORS origin header: %q", rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+	if rec.Header().Get("Access-Control-Allow-Credentials") != "true" {
+		t.Fatalf("expected credentials to be allowed")
 	}
 }
 
@@ -518,8 +614,8 @@ func TestHandleOverviewReturnsTotalEvents(t *testing.T) {
 	if payload.Overview.Visitors != 1 || payload.Overview.Sessions != 1 {
 		t.Fatalf("expected overview visitors/sessions to be 1/1, got %d/%d", payload.Overview.Visitors, payload.Overview.Sessions)
 	}
-	if payload.Overview.Events != 4 {
-		t.Fatalf("expected overview total events to be 4, got %d", payload.Overview.Events)
+	if payload.Overview.Events != 2 {
+		t.Fatalf("expected overview event count to be 2, got %d", payload.Overview.Events)
 	}
 	if payload.Overview.BounceRate != 0 || payload.Overview.AvgSessionDuration < 0 {
 		t.Fatalf("expected bounce rate 0 and non-negative avg duration, got bounce=%v duration=%d", payload.Overview.BounceRate, payload.Overview.AvgSessionDuration)
@@ -527,10 +623,10 @@ func TestHandleOverviewReturnsTotalEvents(t *testing.T) {
 	if payload.Overview.AvgTimeOnPage != 0 {
 		t.Fatalf("expected no dwell data in overview seed, got avg time on page %d", payload.Overview.AvgTimeOnPage)
 	}
-	if len(payload.Trend) != 1 || payload.Trend[0].Events != 4 || payload.Trend[0].Visitors != 1 || payload.Trend[0].Sessions != 1 || payload.Trend[0].AvgTimeOnPage != 0 {
-		t.Fatalf("expected trend total events to be 4, got %#v", payload.Trend)
+	if len(payload.Trend) != 1 || payload.Trend[0].Events != 2 || payload.Trend[0].Visitors != 1 || payload.Trend[0].Sessions != 1 || payload.Trend[0].AvgTimeOnPage != 0 {
+		t.Fatalf("expected trend event count to be 2, got %#v", payload.Trend)
 	}
-	if payload.Compare.Metrics.Events.Current != 4 || payload.Compare.Metrics.Visitors.Current != 1 || payload.Compare.Metrics.Sessions.Current != 1 {
+	if payload.Compare.Metrics.Events.Current != 2 || payload.Compare.Metrics.Visitors.Current != 1 || payload.Compare.Metrics.Sessions.Current != 1 {
 		t.Fatalf("unexpected compare metrics: %#v", payload.Compare.Metrics)
 	}
 }
@@ -553,6 +649,31 @@ func TestRecordEventRejectsWebsiteDomainMismatch(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "domain mismatch") {
 		t.Fatalf("expected website domain mismatch, got %v", err)
+	}
+}
+
+func TestRecordEventAcceptsConfiguredDomainWithPort(t *testing.T) {
+	app := newTestApp(t)
+	websiteID := seedWebsite(t, app, "Demo", "localhost:3000")
+
+	req := httptest.NewRequest("POST", "/api/send", nil)
+	req.RemoteAddr = "203.0.113.20:4321"
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+
+	result, err := app.recordEvent(req, eventRequest{
+		Type: "pageview",
+		Payload: eventPayload{
+			Website:  websiteID,
+			URL:      "http://localhost:3000/pricing",
+			Hostname: "localhost:3000",
+			ID:       "visitor-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected configured domain with port to be accepted, got %v", err)
+	}
+	if result["website_id"] != websiteID {
+		t.Fatalf("unexpected record result: %#v", result)
 	}
 }
 

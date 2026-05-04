@@ -23,6 +23,7 @@
     }
     fetch(origin + "/api/send", {
       method: "POST",
+      mode: "cors",
       headers: { "Content-Type": "application/json" },
       body: body,
       keepalive: true
@@ -33,7 +34,7 @@
     var payload = {
       website: website,
       url: window.location.href,
-      hostname: window.location.hostname,
+      hostname: window.location.host,
       title: document.title,
       referrer: document.referrer || "",
       language: navigator.language || "",
@@ -78,7 +79,7 @@
       lastHeartbeatAt = now;
       collect("event", basePayload({
         url: lastURL,
-        hostname: new URL(lastURL, window.location.href).hostname,
+        hostname: new URL(lastURL, window.location.href).host,
         name: "page_ping",
         data: {
           duration_ms: delta
@@ -97,7 +98,7 @@
     }
     collect("event", basePayload({
       url: currentURL,
-      hostname: new URL(currentURL, window.location.href).hostname,
+      hostname: new URL(currentURL, window.location.href).host,
       name: "page_leave",
       data: {
         duration_ms: Math.max(0, Date.now() - lastPageviewAt)

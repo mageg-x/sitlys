@@ -3,9 +3,9 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"log"
-	"strings"
 	"time"
 )
 
@@ -60,6 +60,9 @@ func (a *App) runEventWriter() {
 }
 
 func (a *App) flushEventBatch(batch []queuedEvent) error {
+	a.eventWriteMu.Lock()
+	defer a.eventWriteMu.Unlock()
+
 	tx, err := a.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return err
@@ -175,16 +178,15 @@ func (a *App) upsertVisitorTx(tx *sql.Tx, websiteID, externalID string, seenAt t
 func (a *App) findOrCreateSessionTx(tx *sql.Tx, candidate sessionRecord) (sessionRecord, bool, error) {
 	var existing sessionRecord
 	var startedAtText, lastSeenText string
-	windowStart := candidate.StartedAt.UTC().Truncate(30 * time.Minute)
-	candidate.SessionKey = sessionWindowKey(candidate.WebsiteID, candidate.VisitorID, windowStart)
 	row := tx.QueryRow(`
 		select id, session_key, website_id, visitor_id, started_at, last_seen_at, event_count, pageviews,
 		       referrer, referrer_domain, utm_source, utm_medium, utm_campaign,
 		       browser, os, device, country, region, city, entry_path, exit_path
 		from sessions
-		where session_key = ?
+		where website_id = ? and visitor_id = ?
+		order by last_seen_at desc
 		limit 1
-	`, candidate.SessionKey)
+	`, candidate.WebsiteID, candidate.VisitorID)
 	err := row.Scan(
 		&existing.ID, &existing.SessionKey, &existing.WebsiteID, &existing.VisitorID, &startedAtText, &lastSeenText,
 		&existing.EventCount, &existing.Pageviews, &existing.Referrer, &existing.ReferrerDomain,
@@ -195,8 +197,11 @@ func (a *App) findOrCreateSessionTx(tx *sql.Tx, candidate sessionRecord) (sessio
 	if err == nil {
 		existing.StartedAt = parseISO(startedAtText)
 		existing.LastSeenAt = parseISO(lastSeenText)
+		existing.PrevLastSeenAt = existing.LastSeenAt
+		existing.PrevPageviews = existing.Pageviews
 	}
 	if err == nil && candidate.StartedAt.Sub(existing.LastSeenAt) <= 30*time.Minute {
+		existing.SessionKey = sessionRollingKey(existing.WebsiteID, existing.VisitorID, existing.StartedAt)
 		existing.LastSeenAt = candidate.LastSeenAt
 		if candidate.ExitPath != "" {
 			existing.ExitPath = candidate.ExitPath
@@ -217,6 +222,7 @@ func (a *App) findOrCreateSessionTx(tx *sql.Tx, candidate sessionRecord) (sessio
 	}
 
 	candidate.ID = newID()
+	candidate.SessionKey = sessionRollingKey(candidate.WebsiteID, candidate.VisitorID, candidate.StartedAt)
 	candidate.EventCount = 1
 	if candidate.Pageviews > 0 {
 		candidate.Pageviews = 1
@@ -233,14 +239,11 @@ func (a *App) findOrCreateSessionTx(tx *sql.Tx, candidate sessionRecord) (sessio
 		candidate.UTMSource, candidate.UTMMedium, candidate.UTMCampaign, candidate.Browser, candidate.OS,
 		candidate.Device, candidate.Country, candidate.Region, candidate.City, candidate.EntryPath, candidate.ExitPath,
 	)
-	if err != nil && strings.Contains(strings.ToLower(err.Error()), "unique") {
-		return a.findOrCreateSessionTx(tx, candidate)
-	}
 	return candidate, true, err
 }
 
-func sessionWindowKey(websiteID, visitorID string, windowStart time.Time) string {
-	return websiteID + ":" + visitorID + ":" + windowStart.Format(time.RFC3339)
+func sessionRollingKey(websiteID, visitorID string, startedAt time.Time) string {
+	return websiteID + ":" + visitorID + ":" + startedAt.UTC().Format(time.RFC3339)
 }
 
 func (a *App) insertEventTx(tx *sql.Tx, record eventRecord) error {
@@ -273,8 +276,15 @@ func (a *App) updateAggregatesTx(tx *sql.Tx, record eventRecord, session session
 	}
 	visitorDelta := 0
 	sessionDelta := 0
+	bouncedSessionsDelta := 0
+	sessionDurationDelta := int64(0)
+	timeOnPageDelta := int64(0)
+	timeOnPageSamplesDelta := 0
 	if isNewSession {
 		sessionDelta = 1
+		if session.Pageviews == 1 {
+			bouncedSessionsDelta = 1
+		}
 		result, err := tx.Exec(`
 			insert or ignore into agg_visitor_daily(website_id, bucket_date, visitor_id)
 			values(?, ?, ?)
@@ -285,17 +295,38 @@ func (a *App) updateAggregatesTx(tx *sql.Tx, record eventRecord, session session
 		if affected, err := result.RowsAffected(); err == nil && affected > 0 {
 			visitorDelta = 1
 		}
+	} else {
+		if session.PrevPageviews == 1 && session.Pageviews > 1 {
+			bouncedSessionsDelta = -1
+		}
+		durationDiff := session.LastSeenAt.Unix() - session.PrevLastSeenAt.Unix()
+		if durationDiff > 0 {
+			sessionDurationDelta = durationDiff
+		}
+	}
+	if record.EventName == "page_leave" || record.EventName == "page_ping" {
+		var payload struct {
+			DurationMS int64 `json:"duration_ms"`
+		}
+		if err := json.Unmarshal([]byte(record.Metadata), &payload); err == nil && payload.DurationMS > 0 {
+			timeOnPageDelta = payload.DurationMS
+			timeOnPageSamplesDelta = 1
+		}
 	}
 	if _, err := tx.Exec(`
-		insert into agg_overview_daily(website_id, bucket_date, pageviews, custom_events, visitors, sessions, revenue)
-		values(?, ?, ?, ?, ?, ?, ?)
+		insert into agg_overview_daily(website_id, bucket_date, pageviews, custom_events, visitors, sessions, bounced_sessions, session_duration_total_seconds, time_on_page_total_ms, time_on_page_samples, revenue)
+		values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		on conflict(website_id, bucket_date) do update set
 			pageviews = pageviews + excluded.pageviews,
 			custom_events = custom_events + excluded.custom_events,
 			visitors = visitors + excluded.visitors,
 			sessions = sessions + excluded.sessions,
+			bounced_sessions = bounced_sessions + excluded.bounced_sessions,
+			session_duration_total_seconds = session_duration_total_seconds + excluded.session_duration_total_seconds,
+			time_on_page_total_ms = time_on_page_total_ms + excluded.time_on_page_total_ms,
+			time_on_page_samples = time_on_page_samples + excluded.time_on_page_samples,
 			revenue = revenue + excluded.revenue
-	`, record.WebsiteID, day, pageviews, customEvents, visitorDelta, sessionDelta, record.Amount); err != nil {
+	`, record.WebsiteID, day, pageviews, customEvents, visitorDelta, sessionDelta, bouncedSessionsDelta, sessionDurationDelta, timeOnPageDelta, timeOnPageSamplesDelta, record.Amount); err != nil {
 		return err
 	}
 

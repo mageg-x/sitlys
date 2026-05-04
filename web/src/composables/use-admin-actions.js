@@ -244,10 +244,13 @@ export function createAdminActions(ctx) {
     URL.revokeObjectURL(objectURL);
   }
 
-  function editWebsite(site) {
+  async function editWebsite(site) {
+    state.websiteId = site.id;
+    localStorage.setItem("sitlys.website_id", site.id);
     websiteForm.id = site.id;
     websiteForm.name = site.name;
     websiteForm.domain = site.domain;
+    await ctx.refreshActive();
   }
 
   function editUser(user) {

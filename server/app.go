@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/oschwald/geoip2-golang"
 	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
 )
@@ -43,29 +44,33 @@ var staticFiles embed.FS
 var trackerScript string
 
 type Config struct {
-	Addr        string
-	DataDir     string
-	DBPath      string
-	SessionDays int
+	Addr          string
+	DataDir       string
+	DBPath        string
+	SessionDays   int
+	GeoIPDBPath   string
 }
 
 type App struct {
-	cfg         Config
-	db          *sql.DB
-	server      *http.Server
-	staticFS    fs.FS
-	staticHTTP  http.Handler
-	eventQueue  chan queuedEvent
-	workerCtx   context.Context
-	workerStop  context.CancelFunc
-	workerWG    sync.WaitGroup
-	rateMu      sync.Mutex
-	rateBuckets map[string]rateBucket
-	botModeMu   sync.RWMutex
-	botMode     string
-	botModeAt   time.Time
-	botAuditMu  sync.Mutex
-	botAudit    map[string]int
+	cfg          Config
+	db           *sql.DB
+	server       *http.Server
+	staticFS     fs.FS
+	staticHTTP   http.Handler
+	eventQueue   chan queuedEvent
+	eventWriteMu sync.Mutex
+	geoIPMu      sync.RWMutex
+	geoIPDB      *geoip2.Reader
+	workerCtx    context.Context
+	workerStop   context.CancelFunc
+	workerWG     sync.WaitGroup
+	rateMu       sync.Mutex
+	rateBuckets  map[string]rateBucket
+	botModeMu    sync.RWMutex
+	botMode      string
+	botModeAt    time.Time
+	botAuditMu   sync.Mutex
+	botAudit     map[string]int
 }
 
 const maxRateBuckets = 4096
@@ -127,6 +132,7 @@ type Funnel struct {
 type SystemSettings struct {
 	ListenAddr        string `json:"listen_addr"`
 	DatabasePath      string `json:"database_path"`
+	GeoIPDatabasePath string `json:"geoip_database_path"`
 	LogLevel          string `json:"log_level"`
 	DataRetentionDays int    `json:"data_retention_days"`
 	BotFilterMode     string `json:"bot_filter_mode"`
@@ -228,6 +234,8 @@ type sessionRecord struct {
 	City           string
 	EntryPath      string
 	ExitPath       string
+	PrevLastSeenAt time.Time
+	PrevPageviews  int
 }
 
 type queuedEvent struct {
@@ -307,6 +315,10 @@ func New(cfg Config) (*App, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := app.reloadGeoIPDB(); err != nil {
+		db.Close()
+		return nil, err
+	}
 
 	sub, err := fs.Sub(staticFiles, "embed")
 	if err != nil {
@@ -333,9 +345,167 @@ func (a *App) Close() error {
 	}
 	a.workerWG.Wait()
 	if a.db != nil {
-		return a.db.Close()
+		if err := a.db.Close(); err != nil {
+			return err
+		}
 	}
+	a.closeGeoIPDB()
 	return nil
+}
+
+func (a *App) closeGeoIPDB() {
+	a.geoIPMu.Lock()
+	defer a.geoIPMu.Unlock()
+	if a.geoIPDB != nil {
+		_ = a.geoIPDB.Close()
+		a.geoIPDB = nil
+	}
+}
+
+func (a *App) reloadGeoIPDB() error {
+	path, err := resolveGeoIPDBPath(a.cfg.GeoIPDBPath, a.cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	if path == "" {
+		a.closeGeoIPDB()
+		return nil
+	}
+	reader, err := geoip2.Open(path)
+	if err != nil {
+		log.Printf("geoip database unavailable at %s, disabling local geo lookup: %v", path, err)
+		a.closeGeoIPDB()
+		return nil
+	}
+	a.geoIPMu.Lock()
+	defer a.geoIPMu.Unlock()
+	if a.geoIPDB != nil {
+		_ = a.geoIPDB.Close()
+	}
+	a.geoIPDB = reader
+	return nil
+}
+
+func resolveGeoIPDBPath(configuredPath, dataDir string) (string, error) {
+	if path := strings.TrimSpace(configuredPath); path != "" {
+		return validateGeoIPDBPath(path)
+	}
+	for _, candidate := range defaultGeoIPDBCandidates(dataDir) {
+		path, err := validateGeoIPDBPath(candidate)
+		if err == nil && path != "" {
+			return path, nil
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+	}
+	return "", nil
+}
+
+func defaultGeoIPDBCandidates(dataDir string) []string {
+	candidates := make([]string, 0, 4)
+	if strings.TrimSpace(dataDir) != "" {
+		candidates = append(candidates, filepath.Join(dataDir, "GeoLite2-City.mmdb"))
+	}
+	if exePath, err := os.Executable(); err == nil && strings.TrimSpace(exePath) != "" {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exePath), "GeoLite2-City.mmdb"))
+	}
+	candidates = append(candidates, "GeoLite2-City.mmdb", filepath.Join("server", "GeoLite2-City.mmdb"))
+	return uniqueNonEmptyPaths(candidates)
+}
+
+func uniqueNonEmptyPaths(paths []string) []string {
+	seen := make(map[string]struct{}, len(paths))
+	unique := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		path = filepath.Clean(path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		unique = append(unique, path)
+	}
+	return unique
+}
+
+func validateGeoIPDBPath(path string) (string, error) {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if path == "" {
+		return "", nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("geoip db path is a directory: %s", path)
+	}
+	return path, nil
+}
+
+func (a *App) lookupGeoIP(rawIP string) (country, region, city string) {
+	ip := net.ParseIP(strings.TrimSpace(rawIP))
+	if ip == nil {
+		return "", "", ""
+	}
+
+	a.geoIPMu.RLock()
+	reader := a.geoIPDB
+	a.geoIPMu.RUnlock()
+	if reader == nil {
+		return "", "", ""
+	}
+
+	record, err := reader.City(ip)
+	if err != nil {
+		return "", "", ""
+	}
+	if record.Country.IsoCode != "" {
+		country = strings.TrimSpace(record.Country.IsoCode)
+	}
+	for _, subdivision := range record.Subdivisions {
+		if subdivision.IsoCode != "" {
+			region = strings.TrimSpace(subdivision.IsoCode)
+			break
+		}
+	}
+	if name := record.City.Names["en"]; name != "" {
+		city = strings.TrimSpace(name)
+	}
+	return
+}
+
+func (a *App) detectGeo(r *http.Request, payload eventPayload) (country, region, city string) {
+	country = strings.TrimSpace(payload.Country)
+	region = strings.TrimSpace(payload.Region)
+	city = strings.TrimSpace(payload.City)
+	if country != "" || region != "" || city != "" {
+		return
+	}
+
+	country = strings.TrimSpace(firstNonEmpty(
+		r.Header.Get("CF-IPCountry"),
+		r.Header.Get("X-Appengine-Country"),
+		r.Header.Get("X-Country-Code"),
+	))
+	region = strings.TrimSpace(firstNonEmpty(
+		r.Header.Get("X-Appengine-Region"),
+		r.Header.Get("CF-Region-Code"),
+		r.Header.Get("X-Region-Code"),
+	))
+	city = strings.TrimSpace(firstNonEmpty(
+		r.Header.Get("X-Appengine-City"),
+		r.Header.Get("CF-IPCity"),
+		r.Header.Get("X-City"),
+	))
+	if country != "" || region != "" || city != "" {
+		return
+	}
+	return a.lookupGeoIP(clientIP(r))
 }
 
 func initDBPragmas(db *sql.DB, dbPath string) error {
@@ -576,6 +746,10 @@ func (a *App) initSchema() error {
 			custom_events integer not null default 0,
 			visitors integer not null default 0,
 			sessions integer not null default 0,
+			bounced_sessions integer not null default 0,
+			session_duration_total_seconds integer not null default 0,
+			time_on_page_total_ms integer not null default 0,
+			time_on_page_samples integer not null default 0,
 			revenue real not null default 0,
 			primary key (website_id, bucket_date)
 		);`,
@@ -667,7 +841,7 @@ func (a *App) initSchema() error {
 			return fmt.Errorf("backfill website_permissions access_level: %w", err)
 		}
 	}
-	for _, column := range []string{"visitors", "sessions"} {
+	for _, column := range []string{"visitors", "sessions", "bounced_sessions", "session_duration_total_seconds", "time_on_page_total_ms", "time_on_page_samples"} {
 		if !a.tableColumnExists("agg_overview_daily", column) {
 			if _, err := a.db.Exec(`alter table agg_overview_daily add column ` + column + ` integer not null default 0`); err != nil {
 				return fmt.Errorf("migrate agg_overview_daily %s: %w", column, err)
@@ -690,15 +864,39 @@ func (a *App) initSchema() error {
 		return fmt.Errorf("backfill sessions session_key: %w", err)
 	}
 	if _, err := a.db.Exec(`
-		insert into agg_overview_daily(website_id, bucket_date, visitors, sessions)
-		select website_id, date(started_at), count(distinct visitor_id), count(*)
+		insert into agg_overview_daily(website_id, bucket_date, visitors, sessions, bounced_sessions, session_duration_total_seconds)
+		select
+			website_id,
+			date(started_at),
+			count(distinct visitor_id),
+			count(*),
+			sum(case when pageviews = 1 then 1 else 0 end),
+			sum(case when unixepoch(last_seen_at) - unixepoch(started_at) > 0 then unixepoch(last_seen_at) - unixepoch(started_at) else 0 end)
 		from sessions
 		group by website_id, date(started_at)
 		on conflict(website_id, bucket_date) do update set
 			visitors = excluded.visitors,
-			sessions = excluded.sessions
+			sessions = excluded.sessions,
+			bounced_sessions = excluded.bounced_sessions,
+			session_duration_total_seconds = excluded.session_duration_total_seconds
 	`); err != nil {
-		return fmt.Errorf("backfill agg_overview_daily sessions/visitors: %w", err)
+		return fmt.Errorf("backfill agg_overview_daily session metrics: %w", err)
+	}
+	if _, err := a.db.Exec(`
+		insert into agg_overview_daily(website_id, bucket_date, time_on_page_total_ms, time_on_page_samples)
+		select
+			website_id,
+			date(created_at),
+			coalesce(sum(cast(json_extract(metadata, '$.duration_ms') as integer)), 0),
+			count(*)
+		from events
+		where event_name in ('page_leave', 'page_ping')
+		group by website_id, date(created_at)
+		on conflict(website_id, bucket_date) do update set
+			time_on_page_total_ms = excluded.time_on_page_total_ms,
+			time_on_page_samples = excluded.time_on_page_samples
+	`); err != nil {
+		return fmt.Errorf("backfill agg_overview_daily time on page: %w", err)
 	}
 	if _, err := a.db.Exec(`
 		insert or ignore into agg_visitor_daily(website_id, bucket_date, visitor_id)
@@ -1023,7 +1221,7 @@ func cleanURL(raw string) (fullURL, host, path string) {
 	if err != nil {
 		return raw, "", ""
 	}
-	host = strings.ToLower(parsed.Hostname())
+	host = strings.TrimSpace(strings.ToLower(parsed.Host))
 	path = parsed.EscapedPath()
 	if path == "" {
 		path = "/"
@@ -1043,7 +1241,14 @@ func normalizeWebsiteDomain(raw string) string {
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(strings.ToLower(parsed.Hostname()))
+	host := strings.TrimSpace(strings.ToLower(parsed.Hostname()))
+	if host == "" {
+		return ""
+	}
+	if port := strings.TrimSpace(parsed.Port()); port != "" {
+		return host + ":" + port
+	}
+	return host
 }
 
 func hostMatchesWebsiteDomain(host, configuredDomain string) bool {
@@ -1052,7 +1257,28 @@ func hostMatchesWebsiteDomain(host, configuredDomain string) bool {
 	if host == "" || configuredDomain == "" {
 		return false
 	}
-	return host == configuredDomain || strings.HasSuffix(host, "."+configuredDomain)
+	if host == configuredDomain {
+		return true
+	}
+	hostName := host
+	configuredName := configuredDomain
+	if strings.Contains(host, ":") {
+		hostName = strings.SplitN(host, ":", 2)[0]
+	}
+	if strings.Contains(configuredDomain, ":") {
+		configuredName = strings.SplitN(configuredDomain, ":", 2)[0]
+		configuredPort := strings.SplitN(configuredDomain, ":", 2)[1]
+		if strings.Contains(host, ":") && strings.SplitN(host, ":", 2)[1] != configuredPort {
+			return false
+		}
+	}
+	if hostName == configuredName {
+		return true
+	}
+	if configuredName == "" {
+		return false
+	}
+	return strings.HasSuffix(hostName, "."+configuredName)
 }
 
 func referrerDomain(raw string) string {
@@ -1265,6 +1491,7 @@ func (a *App) getSystemSettings() (SystemSettings, error) {
 	settings := SystemSettings{
 		ListenAddr:        a.cfg.Addr,
 		DatabasePath:      a.cfg.DBPath,
+		GeoIPDatabasePath: a.cfg.GeoIPDBPath,
 		LogLevel:          "info",
 		DataRetentionDays: 365,
 		BotFilterMode:     "balanced",
@@ -1288,6 +1515,8 @@ func (a *App) getSystemSettings() (SystemSettings, error) {
 			settings.ListenAddr = value
 		case "database_path":
 			settings.DatabasePath = value
+		case "geoip_database_path":
+			settings.GeoIPDatabasePath = value
 		case "log_level":
 			settings.LogLevel = value
 		case "data_retention_days":
@@ -1310,6 +1539,7 @@ func (a *App) getSystemSettings() (SystemSettings, error) {
 
 func (a *App) setSystemSettings(values map[string]string) error {
 	now := iso(nowUTC())
+	nextGeoIPPath, hasGeoIPPath := values["geoip_database_path"]
 	nextBotMode, hasBotMode := values["bot_filter_mode"]
 	tx, err := a.db.Begin()
 	if err != nil {
@@ -1330,6 +1560,12 @@ func (a *App) setSystemSettings(values map[string]string) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return err
+	}
+	if hasGeoIPPath {
+		a.cfg.GeoIPDBPath = strings.TrimSpace(nextGeoIPPath)
+		if err := a.reloadGeoIPDB(); err != nil {
+			return err
+		}
 	}
 	if hasBotMode {
 		a.updateBotFilterModeCache(nextBotMode)
@@ -1558,6 +1794,7 @@ func (a *App) cleanupHistoricalData(retentionDays int) (map[string]any, error) {
 
 	aggregateTables := []string{
 		"agg_overview_daily",
+		"agg_visitor_daily",
 		"agg_pages_daily",
 		"agg_referrers_daily",
 		"agg_devices_daily",

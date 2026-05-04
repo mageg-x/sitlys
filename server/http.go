@@ -71,6 +71,7 @@ type funnelInput struct {
 type settingsInput struct {
 	ListenAddr        string `json:"listen_addr"`
 	DatabasePath      string `json:"database_path"`
+	GeoIPDatabasePath string `json:"geoip_database_path"`
 	LogLevel          string `json:"log_level"`
 	DataRetentionDays int    `json:"data_retention_days"`
 	BotFilterMode     string `json:"bot_filter_mode"`
@@ -88,10 +89,17 @@ func (a *App) handleTracker(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, "tracker.js", nowUTC(), strings.NewReader(trackerScript))
 }
 
-func setCollectionCORS(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+func setCollectionCORS(w http.ResponseWriter, r *http.Request) {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		w.Header().Add("Vary", "Origin")
+	} else {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+	}
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 	w.Header().Set("Access-Control-Max-Age", "86400")
 }
 
@@ -917,7 +925,7 @@ func (a *App) handleCollectPixel(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	setCollectionCORS(w)
+	setCollectionCORS(w, r)
 	var pixelID, websiteID string
 	var enabled int
 	err := a.db.QueryRow(`select id, website_id, enabled from pixels where slug = ?`, slug).Scan(&pixelID, &websiteID, &enabled)
@@ -934,6 +942,14 @@ func (a *App) handleCollectPixel(w http.ResponseWriter, r *http.Request) {
 	}
 	query := r.URL.Query()
 	pixelURL := firstNonEmpty(strings.TrimSpace(query.Get("url")), r.Referer(), r.URL.String())
+	_, pixelHost, _ := cleanURL(pixelURL)
+	if !a.websiteAllowsHost(websiteID, pixelHost) {
+		w.Header().Set("Content-Type", "image/gif")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write(onePixelGIF)
+		return
+	}
 	visitorID := firstNonEmpty(strings.TrimSpace(query.Get("id")), strings.TrimSpace(query.Get("vid")))
 	req := eventRequest{
 		Type: "event",
@@ -955,7 +971,7 @@ func (a *App) handleCollectPixel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleSend(w http.ResponseWriter, r *http.Request) {
-	setCollectionCORS(w)
+	setCollectionCORS(w, r)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -979,7 +995,7 @@ func (a *App) handleSend(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleBatch(w http.ResponseWriter, r *http.Request) {
-	setCollectionCORS(w)
+	setCollectionCORS(w, r)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -1043,6 +1059,7 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		req.ListenAddr = strings.TrimSpace(req.ListenAddr)
 		req.DatabasePath = strings.TrimSpace(req.DatabasePath)
+		req.GeoIPDatabasePath = strings.TrimSpace(req.GeoIPDatabasePath)
 		req.LogLevel = strings.TrimSpace(strings.ToLower(req.LogLevel))
 		req.BotFilterMode = strings.TrimSpace(strings.ToLower(req.BotFilterMode))
 
@@ -1064,11 +1081,12 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if err := a.setSystemSettings(map[string]string{
-			"listen_addr":         req.ListenAddr,
-			"database_path":       req.DatabasePath,
-			"log_level":           req.LogLevel,
-			"data_retention_days": strconv.Itoa(retentionDays),
-			"bot_filter_mode":     req.BotFilterMode,
+			"listen_addr":          req.ListenAddr,
+			"database_path":        req.DatabasePath,
+			"geoip_database_path":  req.GeoIPDatabasePath,
+			"log_level":            req.LogLevel,
+			"data_retention_days":  strconv.Itoa(retentionDays),
+			"bot_filter_mode":      req.BotFilterMode,
 		}); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "save settings failed")
 			return
@@ -1167,7 +1185,7 @@ func (a *App) recordEvent(r *http.Request, req eventRequest) (map[string]any, er
 	}
 	refDomain := referrerDomain(payload.Referrer)
 	browser, osName, device := detectUserAgent(r, payload)
-	country, region, city := detectGeo(r, payload)
+	country, region, city := a.detectGeo(r, payload)
 	if ignored, reason := a.shouldIgnoreBotTraffic(r); ignored {
 		a.recordBotAudit(reason)
 		return map[string]any{
@@ -1339,31 +1357,34 @@ func (a *App) handleOverview(w http.ResponseWriter, r *http.Request) {
 	}
 	var out overview
 	var customEvents int64
+	var bouncedSessions, sessionDurationTotalSeconds, timeOnPageTotalMS, timeOnPageSamples int64
 	if err := a.db.QueryRow(`
 		select
 			coalesce(sum(pageviews), 0),
 			coalesce(sum(custom_events), 0),
 			coalesce(sum(visitors), 0),
 			coalesce(sum(sessions), 0),
+			coalesce(sum(bounced_sessions), 0),
+			coalesce(sum(session_duration_total_seconds), 0),
+			coalesce(sum(time_on_page_total_ms), 0),
+			coalesce(sum(time_on_page_samples), 0),
 			coalesce(sum(revenue), 0)
 		from agg_overview_daily
 		where website_id = ? and bucket_date between ? and ?
-	`, websiteID, from.Format("2006-01-02"), to.Format("2006-01-02")).Scan(&out.Pageviews, &customEvents, &out.Visitors, &out.Sessions, &out.Revenue); err != nil {
+	`, websiteID, from.Format("2006-01-02"), to.Format("2006-01-02")).Scan(&out.Pageviews, &customEvents, &out.Visitors, &out.Sessions, &bouncedSessions, &sessionDurationTotalSeconds, &timeOnPageTotalMS, &timeOnPageSamples, &out.Revenue); err != nil {
 		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	out.Events = out.Pageviews + customEvents
-	if err := a.db.QueryRow(`
-		select
-			coalesce(avg(case when pageviews = 1 then 1.0 else 0.0 end), 0),
-			coalesce(avg(max(0, unixepoch(last_seen_at) - unixepoch(started_at))), 0)
-		from sessions
-		where website_id = ? and started_at between ? and ?
-	`, websiteID, iso(from), iso(to)).Scan(&out.BounceRate, &out.AvgSessionDuration); err != nil {
-		errorResponse(w, http.StatusInternalServerError, err.Error())
-		return
+	out.Events = customEvents
+	if out.Sessions > 0 {
+		out.BounceRate = float64(bouncedSessions) / float64(out.Sessions)
+		out.AvgSessionDuration = int64(math.Round(float64(sessionDurationTotalSeconds) / float64(out.Sessions)))
 	}
-	out.AvgTimeOnPage = a.queryAverageTimeOnPageSeconds(websiteID, from, to)
+	if timeOnPageSamples > 0 {
+		out.AvgTimeOnPage = int64(math.Round(float64(timeOnPageTotalMS) / float64(timeOnPageSamples) / 1000))
+	} else {
+		out.AvgTimeOnPage = 0
+	}
 	trendRows, err := a.db.Query(`
 		select
 			o.bucket_date,
@@ -1403,7 +1424,7 @@ func (a *App) handleOverview(w http.ResponseWriter, r *http.Request) {
 			"pageviews":                pageviews,
 			"visitors":                 visitors,
 			"sessions":                 sessions,
-			"events":                   pageviews + customEvents,
+			"events":                   customEvents,
 			"revenue":                  revenue,
 			"avg_time_on_page_seconds": int64(math.Round(avgTimeOnPage)),
 		})
@@ -1563,6 +1584,7 @@ func (a *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 		from events
 		where website_id = ?
 			and event_type <> 'pageview'
+			and event_name not in ('page_leave', 'page_ping')
 			and created_at between ? and ?
 		group by event_type, label
 		order by events desc, label asc
@@ -2239,42 +2261,39 @@ func (a *App) loadOverviewCompare(websiteID string, from, to time.Time) (map[str
 	}
 	var current, previous overview
 	var currentCustomEvents, previousCustomEvents int64
+	var currentBouncedSessions, previousBouncedSessions int64
+	var currentTimeOnPageTotalMS, previousTimeOnPageTotalMS int64
+	var currentTimeOnPageSamples, previousTimeOnPageSamples int64
 	if err := a.db.QueryRow(`
-		select coalesce(sum(pageviews), 0), coalesce(sum(custom_events), 0), coalesce(sum(visitors), 0), coalesce(sum(sessions), 0), coalesce(sum(revenue), 0)
+		select coalesce(sum(pageviews), 0), coalesce(sum(custom_events), 0), coalesce(sum(visitors), 0), coalesce(sum(sessions), 0), coalesce(sum(bounced_sessions), 0), coalesce(sum(session_duration_total_seconds), 0), coalesce(sum(time_on_page_total_ms), 0), coalesce(sum(time_on_page_samples), 0), coalesce(sum(revenue), 0)
 		from agg_overview_daily
 		where website_id = ? and bucket_date between ? and ?
-	`, websiteID, from.Format("2006-01-02"), to.Format("2006-01-02")).Scan(&current.Pageviews, &currentCustomEvents, &current.Visitors, &current.Sessions, &current.Revenue); err != nil {
+	`, websiteID, from.Format("2006-01-02"), to.Format("2006-01-02")).Scan(&current.Pageviews, &currentCustomEvents, &current.Visitors, &current.Sessions, &currentBouncedSessions, &current.AvgSessionDuration, &currentTimeOnPageTotalMS, &currentTimeOnPageSamples, &current.Revenue); err != nil {
 		return nil, err
 	}
-	current.Events = current.Pageviews + currentCustomEvents
-	if err := a.db.QueryRow(`
-		select
-			coalesce(avg(case when pageviews = 1 then 1.0 else 0.0 end), 0),
-			coalesce(avg(max(0, unixepoch(last_seen_at) - unixepoch(started_at))), 0)
-		from sessions
-		where website_id = ? and started_at between ? and ?
-	`, websiteID, iso(from), iso(to)).Scan(&current.BounceRate, &current.AvgSessionDuration); err != nil {
-		return nil, err
+	current.Events = currentCustomEvents
+	if current.Sessions > 0 {
+		current.BounceRate = float64(currentBouncedSessions) / float64(current.Sessions)
+		current.AvgSessionDuration = int64(math.Round(float64(current.AvgSessionDuration) / float64(current.Sessions)))
 	}
-	current.AvgTimeOnPage = a.queryAverageTimeOnPageSeconds(websiteID, from, to)
+	if currentTimeOnPageSamples > 0 {
+		current.AvgTimeOnPage = int64(math.Round(float64(currentTimeOnPageTotalMS) / float64(currentTimeOnPageSamples) / 1000))
+	}
 	if err := a.db.QueryRow(`
-		select coalesce(sum(pageviews), 0), coalesce(sum(custom_events), 0), coalesce(sum(visitors), 0), coalesce(sum(sessions), 0), coalesce(sum(revenue), 0)
+		select coalesce(sum(pageviews), 0), coalesce(sum(custom_events), 0), coalesce(sum(visitors), 0), coalesce(sum(sessions), 0), coalesce(sum(bounced_sessions), 0), coalesce(sum(session_duration_total_seconds), 0), coalesce(sum(time_on_page_total_ms), 0), coalesce(sum(time_on_page_samples), 0), coalesce(sum(revenue), 0)
 		from agg_overview_daily
 		where website_id = ? and bucket_date between ? and ?
-	`, websiteID, prevFrom.Format("2006-01-02"), prevTo.Format("2006-01-02")).Scan(&previous.Pageviews, &previousCustomEvents, &previous.Visitors, &previous.Sessions, &previous.Revenue); err != nil {
+	`, websiteID, prevFrom.Format("2006-01-02"), prevTo.Format("2006-01-02")).Scan(&previous.Pageviews, &previousCustomEvents, &previous.Visitors, &previous.Sessions, &previousBouncedSessions, &previous.AvgSessionDuration, &previousTimeOnPageTotalMS, &previousTimeOnPageSamples, &previous.Revenue); err != nil {
 		return nil, err
 	}
-	previous.Events = previous.Pageviews + previousCustomEvents
-	if err := a.db.QueryRow(`
-		select
-			coalesce(avg(case when pageviews = 1 then 1.0 else 0.0 end), 0),
-			coalesce(avg(max(0, unixepoch(last_seen_at) - unixepoch(started_at))), 0)
-		from sessions
-		where website_id = ? and started_at between ? and ?
-	`, websiteID, iso(prevFrom), iso(prevTo)).Scan(&previous.BounceRate, &previous.AvgSessionDuration); err != nil {
-		return nil, err
+	previous.Events = previousCustomEvents
+	if previous.Sessions > 0 {
+		previous.BounceRate = float64(previousBouncedSessions) / float64(previous.Sessions)
+		previous.AvgSessionDuration = int64(math.Round(float64(previous.AvgSessionDuration) / float64(previous.Sessions)))
 	}
-	previous.AvgTimeOnPage = a.queryAverageTimeOnPageSeconds(websiteID, prevFrom, prevTo)
+	if previousTimeOnPageSamples > 0 {
+		previous.AvgTimeOnPage = int64(math.Round(float64(previousTimeOnPageTotalMS) / float64(previousTimeOnPageSamples) / 1000))
+	}
 
 	return map[string]any{
 		"from": iso(prevFrom),
