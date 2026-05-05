@@ -86,6 +86,7 @@ func (a *App) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 func (a *App) handleTracker(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Cross-Origin-Resource-Policy", "cross-origin")
 	http.ServeContent(w, r, "tracker.js", nowUTC(), strings.NewReader(trackerScript))
 }
 
