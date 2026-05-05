@@ -624,8 +624,18 @@ export function createAppController({ t, localeRef }) {
 
   const trackerSnippet = computed(() => {
     if (!state.websiteId) return t("websiteRequired");
-    return `<script async data-website-id="${state.websiteId}" src="${origin}/tracker.js"></script>`;
+    const versionQuery = state.version ? `?v=${encodeURIComponent(state.version)}` : "";
+    return `<script async crossorigin data-website-id="${state.websiteId}" src="${origin}/tracker.js${versionQuery}"></script>`;
   });
+
+  const nginxSnippet = computed(() => `location / {
+    proxy_pass http://127.0.0.1:8486;
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }`);
 
   const firstPixelSnippet = computed(() => {
     if (!state.pixels.length) return t("noData");
@@ -928,6 +938,7 @@ export function createAppController({ t, localeRef }) {
     retentionHighlights,
     funnelHighlights,
     trackerSnippet,
+    nginxSnippet,
     firstPixelSnippet,
     firstShareLink,
     pageColumns,

@@ -132,6 +132,18 @@ func TestDetectGeoWithoutHeadersOrDBReturnsEmpty(t *testing.T) {
 	}
 }
 
+func TestNormalizeGeoCountry(t *testing.T) {
+	if got := normalizeGeoCountry("中国"); got != "CN" {
+		t.Fatalf("expected 中国 to normalize to CN, got %q", got)
+	}
+	if got := normalizeGeoCountry("US"); got != "US" {
+		t.Fatalf("expected US to stay US, got %q", got)
+	}
+	if got := normalizeGeoCountry(""); got != "" {
+		t.Fatalf("expected empty country to stay empty, got %q", got)
+	}
+}
+
 func TestResolveGeoIPDBPathFallsBackToRepoCopy(t *testing.T) {
 	path, err := resolveGeoIPDBPath("", t.TempDir())
 	if err != nil {
@@ -677,6 +689,55 @@ func TestRecordEventAcceptsConfiguredDomainWithPort(t *testing.T) {
 	}
 }
 
+func TestRecordEventAcceptsMatchingOriginWhenPayloadURLMissing(t *testing.T) {
+	app := newTestApp(t)
+	websiteID := seedWebsite(t, app, "Demo", "kefu.mageg.cn")
+
+	req := httptest.NewRequest("POST", "/api/send", nil)
+	req.RemoteAddr = "203.0.113.20:4321"
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("Origin", "https://kefu.mageg.cn")
+
+	result, err := app.recordEvent(req, eventRequest{
+		Type: "pageview",
+		Payload: eventPayload{
+			Website: websiteID,
+			ID:      "visitor-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected matching origin to be accepted, got %v", err)
+	}
+	if result["website_id"] != websiteID {
+		t.Fatalf("unexpected record result: %#v", result)
+	}
+}
+
+func TestRecordEventAcceptsMatchingRefererWhenPayloadHostMissing(t *testing.T) {
+	app := newTestApp(t)
+	websiteID := seedWebsite(t, app, "Demo", "kefu.mageg.cn")
+
+	req := httptest.NewRequest("POST", "/api/send", nil)
+	req.RemoteAddr = "203.0.113.20:4321"
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("Referer", "https://kefu.mageg.cn/chat")
+
+	result, err := app.recordEvent(req, eventRequest{
+		Type: "event",
+		Payload: eventPayload{
+			Website: websiteID,
+			Name:    "signup",
+			ID:      "visitor-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected matching referer to be accepted, got %v", err)
+	}
+	if result["website_id"] != websiteID {
+		t.Fatalf("unexpected record result: %#v", result)
+	}
+}
+
 func TestHandleBatchRateLimitsEachWebsite(t *testing.T) {
 	app := newTestApp(t)
 	websiteA := seedWebsite(t, app, "A", "a.local")
@@ -707,9 +768,9 @@ func TestHandleBatchRateLimitsEachWebsite(t *testing.T) {
 	var payload struct {
 		Partial bool `json:"partial"`
 		Items   []struct {
-			OK       bool   `json:"ok"`
-			Error    string `json:"error"`
-			Result   struct {
+			OK     bool   `json:"ok"`
+			Error  string `json:"error"`
+			Result struct {
 				WebsiteID string `json:"website_id"`
 			} `json:"result"`
 			WebsiteID string `json:"website_id"`

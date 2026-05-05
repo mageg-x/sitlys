@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/oschwald/geoip2-golang"
+	"github.com/xiaoqidun/qqwry"
 	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
 )
@@ -44,11 +45,11 @@ var staticFiles embed.FS
 var trackerScript string
 
 type Config struct {
-	Addr          string
-	DataDir       string
-	DBPath        string
-	SessionDays   int
-	GeoIPDBPath   string
+	Addr        string
+	DataDir     string
+	DBPath      string
+	SessionDays int
+	GeoIPDBPath string
 }
 
 type App struct {
@@ -61,6 +62,8 @@ type App struct {
 	eventWriteMu sync.Mutex
 	geoIPMu      sync.RWMutex
 	geoIPDB      *geoip2.Reader
+	qqwryMu      sync.RWMutex
+	qqwryDB      *qqwry.Client
 	workerCtx    context.Context
 	workerStop   context.CancelFunc
 	workerWG     sync.WaitGroup
@@ -320,6 +323,11 @@ func New(cfg Config) (*App, error) {
 		return nil, err
 	}
 
+	if err := app.reloadQQWryDB(); err != nil {
+		db.Close()
+		return nil, err
+	}
+
 	sub, err := fs.Sub(staticFiles, "embed")
 	if err != nil {
 		db.Close()
@@ -359,6 +367,98 @@ func (a *App) closeGeoIPDB() {
 	if a.geoIPDB != nil {
 		_ = a.geoIPDB.Close()
 		a.geoIPDB = nil
+	}
+}
+
+func cleanGeoLabel(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func (a *App) reloadQQWryDB() error {
+	candidates := []string{
+		filepath.Join(a.cfg.DataDir, "qqwry.ipdb"),
+		filepath.Join("server", "qqwry.ipdb"),
+		"qqwry.ipdb",
+	}
+	if wd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(wd, "qqwry.ipdb"))
+		candidates = append(candidates, filepath.Join(wd, "server", "qqwry.ipdb"))
+	}
+	var path string
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			path = c
+			break
+		}
+	}
+	if path == "" {
+		a.closeQQWryDB()
+		return nil
+	}
+	db, err := qqwry.NewClient(path)
+	if err != nil {
+		log.Printf("qqwry database unavailable at %s: %v", path, err)
+		a.closeQQWryDB()
+		return nil
+	}
+	a.qqwryMu.Lock()
+	defer a.qqwryMu.Unlock()
+	a.qqwryDB = db
+	log.Printf("qqwry database loaded from %s", path)
+	return nil
+}
+
+func (a *App) closeQQWryDB() {
+	a.qqwryMu.Lock()
+	defer a.qqwryMu.Unlock()
+	a.qqwryDB = nil
+}
+
+func (a *App) lookupQQWry(ip string) (country, region, city string) {
+	a.qqwryMu.RLock()
+	db := a.qqwryDB
+	a.qqwryMu.RUnlock()
+	if db == nil {
+		return "", "", ""
+	}
+	location, err := db.QueryIP(strings.TrimSpace(ip))
+	if err != nil || location == nil {
+		return "", "", ""
+	}
+	country = normalizeGeoCountry(location.Country)
+	if isIgnoredGeoCountry(country) {
+		return "", "", ""
+	}
+	region = strings.TrimSpace(location.Province)
+	city = strings.TrimSpace(location.City)
+	if city == "" {
+		city = strings.TrimSpace(location.District)
+	}
+	return
+}
+
+func normalizeGeoCountry(country string) string {
+	country = strings.TrimSpace(country)
+	switch country {
+	case "", "0":
+		return ""
+	case "中国":
+		return "CN"
+	default:
+		return country
+	}
+}
+
+func isIgnoredGeoCountry(country string) bool {
+	switch strings.ToUpper(strings.TrimSpace(country)) {
+	case "", "0", "IANA", "LAN":
+		return true
+	default:
+		return country == "局域网"
 	}
 }
 
@@ -451,6 +551,11 @@ func (a *App) lookupGeoIP(rawIP string) (country, region, city string) {
 	ip := net.ParseIP(strings.TrimSpace(rawIP))
 	if ip == nil {
 		return "", "", ""
+	}
+
+	country, region, city = a.lookupQQWry(rawIP)
+	if country != "" {
+		return
 	}
 
 	a.geoIPMu.RLock()

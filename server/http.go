@@ -86,7 +86,9 @@ func (a *App) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 func (a *App) handleTracker(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Cross-Origin-Resource-Policy", "cross-origin")
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 	http.ServeContent(w, r, "tracker.js", nowUTC(), strings.NewReader(trackerScript))
 }
 
@@ -944,7 +946,9 @@ func (a *App) handleCollectPixel(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	pixelURL := firstNonEmpty(strings.TrimSpace(query.Get("url")), r.Referer(), r.URL.String())
 	_, pixelHost, _ := cleanURL(pixelURL)
-	if !a.websiteAllowsHost(websiteID, pixelHost) {
+	_, originHost, _ := cleanURL(strings.TrimSpace(r.Header.Get("Origin")))
+	_, refererHost, _ := cleanURL(strings.TrimSpace(r.Referer()))
+	if !a.websiteAllowsAnyHost(websiteID, pixelHost, originHost, refererHost) {
 		w.Header().Set("Content-Type", "image/gif")
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 		w.WriteHeader(http.StatusBadRequest)
@@ -1181,7 +1185,9 @@ func (a *App) recordEvent(r *http.Request, req eventRequest) (map[string]any, er
 		fullURL = "https://" + strings.TrimPrefix(fullURL, "/")
 	}
 	parsedURL, host, pathValue := cleanURL(fullURL)
-	if !a.websiteAllowsHost(websiteID, firstNonEmpty(payload.Hostname, host)) {
+	_, originHost, _ := cleanURL(strings.TrimSpace(r.Header.Get("Origin")))
+	_, refererHost, _ := cleanURL(strings.TrimSpace(firstNonEmpty(payload.Referrer, r.Referer())))
+	if !a.websiteAllowsAnyHost(websiteID, payload.Hostname, host, originHost, refererHost) {
 		return nil, fmt.Errorf("website domain mismatch")
 	}
 	refDomain := referrerDomain(payload.Referrer)
@@ -1197,6 +1203,8 @@ func (a *App) recordEvent(r *http.Request, req eventRequest) (map[string]any, er
 	}
 	if payload.Hostname != "" {
 		host = payload.Hostname
+	} else if host == "" {
+		host = firstNonEmpty(originHost, refererHost)
 	}
 	if pathValue == "" {
 		pathValue = "/"
@@ -1282,6 +1290,15 @@ func (a *App) websiteAllowsHost(websiteID, host string) bool {
 		return false
 	}
 	return hostMatchesWebsiteDomain(host, configuredDomain)
+}
+
+func (a *App) websiteAllowsAnyHost(websiteID string, hosts ...string) bool {
+	for _, host := range hosts {
+		if a.websiteAllowsHost(websiteID, host) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *App) websiteForPixel(pixelID string) string {
@@ -1707,9 +1724,7 @@ func (a *App) handleGeo(w http.ResponseWriter, r *http.Request) {
 			errorResponse(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		if country == "" {
-			country = "(unknown)"
-		}
+		country = cleanGeoLabel(country, "(unknown)")
 		items = append(items, map[string]any{"country": country, "visits": visits})
 	}
 
@@ -1734,7 +1749,7 @@ func (a *App) handleGeo(w http.ResponseWriter, r *http.Request) {
 			errorResponse(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		regions = append(regions, map[string]any{"region": region, "visits": visits})
+		regions = append(regions, map[string]any{"region": cleanGeoLabel(region, "Unknown"), "visits": visits})
 	}
 
 	cityRows, err := a.db.Query(`
@@ -1758,7 +1773,7 @@ func (a *App) handleGeo(w http.ResponseWriter, r *http.Request) {
 			errorResponse(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		cities = append(cities, map[string]any{"city": city, "visits": visits})
+		cities = append(cities, map[string]any{"city": cleanGeoLabel(city, "Unknown"), "visits": visits})
 	}
 
 	jsonResponse(w, http.StatusOK, map[string]any{

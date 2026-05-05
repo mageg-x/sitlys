@@ -78,6 +78,11 @@
           <pre>{{ app.trackerSnippet }}</pre>
         </section>
 
+        <section class="setting-card">
+          <span>{{ app.t("nginxSnippet") }}</span>
+          <pre>{{ app.nginxSnippet }}</pre>
+        </section>
+
         <div v-if="app.state.websites.length" class="card-list">
           <button
             v-for="site in app.state.websites"
