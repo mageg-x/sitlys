@@ -4,10 +4,7 @@ import (
 	"context"
 	"flag"
 	"log"
-	"os"
 	"os/signal"
-	"path/filepath"
-	"runtime"
 	"syscall"
 )
 
@@ -37,40 +34,4 @@ func main() {
 	if err := svc.Run(ctx); err != nil {
 		log.Fatalf("run app: %v", err)
 	}
-}
-
-func defaultDataDir() string {
-	switch runtime.GOOS {
-	case "windows":
-		if appData := os.Getenv("APPDATA"); appData != "" {
-			return filepath.Join(appData, "sitlys")
-		}
-		if homeDir, err := os.UserHomeDir(); err == nil && homeDir != "" {
-			return filepath.Join(homeDir, "AppData", "Roaming", "sitlys")
-		}
-	case "darwin":
-		if homeDir, err := os.UserHomeDir(); err == nil && homeDir != "" {
-			return filepath.Join(homeDir, "Library", "Application Support", "sitlys")
-		}
-	default:
-		if homeDir, err := os.UserHomeDir(); err == nil && homeDir != "" {
-			return filepath.Join(homeDir, ".sitlys")
-		}
-	}
-	return "./data"
-}
-
-func resolvePaths(dataDir, dbPath string) (string, string) {
-	if dbPath != "" {
-		dbPath = filepath.Clean(dbPath)
-		if dataDir == "" {
-			dataDir = filepath.Dir(dbPath)
-		}
-		return filepath.Clean(dataDir), dbPath
-	}
-	if dataDir == "" {
-		dataDir = defaultDataDir()
-	}
-	dataDir = filepath.Clean(dataDir)
-	return dataDir, filepath.Join(dataDir, "sitlys.db")
 }

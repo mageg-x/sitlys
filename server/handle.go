@@ -1,15 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"database/sql"
-	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io/fs"
 	"math"
 	"net/http"
-	"net/url"
 	"path"
 	"sort"
 	"strconv"
@@ -1337,26 +1334,6 @@ func (r eventRecord) PixelValue() any {
 	return r.PixelID
 }
 
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
-}
-
-func extractUTM(rawURL, key string) string {
-	if rawURL == "" {
-		return ""
-	}
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return ""
-	}
-	return parsed.Query().Get(key)
-}
-
 func (a *App) handleOverview(w http.ResponseWriter, r *http.Request) {
 	user, websiteID, from, to, ok := a.analyticsContext(w, r)
 	if !ok || !a.requireWebsiteView(w, user, websiteID) {
@@ -2013,13 +1990,6 @@ func (a *App) handleRetention(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]any{"ok": true, "items": items})
 }
 
-func retentionRate(hit, total int) float64 {
-	if total == 0 {
-		return 0
-	}
-	return float64(hit) / float64(total)
-}
-
 func (a *App) handleFunnelReport(w http.ResponseWriter, r *http.Request) {
 	user, websiteID, from, to, ok := a.analyticsContext(w, r)
 	if !ok || !a.requireWebsiteView(w, user, websiteID) {
@@ -2226,37 +2196,6 @@ func (a *App) exportPages(w http.ResponseWriter, _ *http.Request, websiteID stri
 	writeExport(w, format, "pages", headers, records)
 }
 
-func writeExport(w http.ResponseWriter, format, name string, headers []string, records [][]string) {
-	if format == "json" {
-		items := make([]map[string]string, 0, len(records))
-		for _, record := range records {
-			item := make(map[string]string, len(headers))
-			for index, header := range headers {
-				if index < len(record) {
-					item[header] = record[index]
-				}
-			}
-			items = append(items, item)
-		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.json"`, name))
-		jsonResponse(w, http.StatusOK, map[string]any{"ok": true, "items": items})
-		return
-	}
-
-	var buffer bytes.Buffer
-	writer := csv.NewWriter(&buffer)
-	_ = writer.Write(headers)
-	for _, record := range records {
-		_ = writer.Write(record)
-	}
-	writer.Flush()
-	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.csv"`, name))
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(buffer.Bytes())
-}
-
 func (a *App) loadOverviewCompare(websiteID string, from, to time.Time) (map[string]any, error) {
 	duration := to.Sub(from)
 	if duration < 0 {
@@ -2340,24 +2279,6 @@ func (a *App) loadOverviewCompare(websiteID string, from, to time.Time) (map[str
 			},
 		},
 	}, nil
-}
-
-func metricDelta(current, previous int64) map[string]any {
-	change := current - previous
-	changeRate := 0.0
-	if previous > 0 {
-		changeRate = float64(change) / float64(previous)
-	}
-	return map[string]any{"current": current, "previous": previous, "change": change, "change_rate": changeRate}
-}
-
-func metricDeltaFloat(current, previous float64) map[string]any {
-	change := current - previous
-	changeRate := 0.0
-	if previous > 0 {
-		changeRate = change / previous
-	}
-	return map[string]any{"current": current, "previous": previous, "change": change, "change_rate": changeRate}
 }
 
 func (a *App) listFunnels(websiteID string) ([]Funnel, error) {

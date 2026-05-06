@@ -242,10 +242,6 @@ func (a *App) findOrCreateSessionTx(tx *sql.Tx, candidate sessionRecord) (sessio
 	return candidate, true, err
 }
 
-func sessionRollingKey(websiteID, visitorID string, startedAt time.Time) string {
-	return websiteID + ":" + visitorID + ":" + startedAt.UTC().Format(time.RFC3339)
-}
-
 func (a *App) insertEventTx(tx *sql.Tx, record eventRecord) error {
 	_, err := tx.Exec(`
 		insert into events(
@@ -426,35 +422,4 @@ func (a *App) updateAggregatesTx(tx *sql.Tx, record eventRecord, session session
 	}
 
 	return nil
-}
-
-func attributionKey(session sessionRecord) (string, string, string) {
-	source := session.UTMSource
-	if source == "" {
-		if session.ReferrerDomain != "" {
-			source = session.ReferrerDomain
-		} else {
-			source = "(direct)"
-		}
-	}
-	medium := session.UTMMedium
-	if medium == "" {
-		if session.ReferrerDomain != "" {
-			medium = "referral"
-		} else {
-			medium = "(none)"
-		}
-	}
-	campaign := session.UTMCampaign
-	if campaign == "" {
-		campaign = "(none)"
-	}
-	return source, medium, campaign
-}
-
-func nullUnknown(value string) string {
-	if value == "" {
-		return "Unknown"
-	}
-	return value
 }
