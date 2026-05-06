@@ -1,3 +1,9 @@
+// Package main - 地理位置解析模块
+// 负责根据 IP 地址解析访问者的地理位置信息（国家、地区、城市）
+// 支持多种数据源：
+//   - MaxMind GeoIP2 数据库（国际 IP 精确度高）
+//   - 纯真 IP 数据库（中国 IP 覆盖好）
+//   - CDN/代理传递的 HTTP 头（Cloudflare、App Engine 等）
 package main
 
 import (
@@ -14,6 +20,7 @@ import (
 	"github.com/xiaoqidun/qqwry"
 )
 
+// closeGeoIPDB - 关闭 MaxMind GeoIP2 数据库连接
 func (a *App) closeGeoIPDB() {
 	a.geoIPMu.Lock()
 	defer a.geoIPMu.Unlock()
@@ -23,6 +30,8 @@ func (a *App) closeGeoIPDB() {
 	}
 }
 
+// cleanGeoLabel - 清理地理位置标签
+// 如果 value 为空则返回 fallback 默认值
 func cleanGeoLabel(value, fallback string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -31,6 +40,8 @@ func cleanGeoLabel(value, fallback string) string {
 	return value
 }
 
+// reloadQQWryDB - 重新加载纯真 IP 数据库
+// 在多个候选路径中查找 qqwry.ipdb 文件
 func (a *App) reloadQQWryDB() error {
 	candidates := []string{
 		filepath.Join(a.cfg.DataDir, "qqwry.ipdb"),
@@ -54,6 +65,7 @@ func (a *App) reloadQQWryDB() error {
 	}
 	db, err := qqwry.NewClient(path)
 	if err != nil {
+		Error("qqwry database unavailable at %s: %v", path, err)
 		log.Printf("qqwry database unavailable at %s: %v", path, err)
 		a.closeQQWryDB()
 		return nil
@@ -65,12 +77,15 @@ func (a *App) reloadQQWryDB() error {
 	return nil
 }
 
+// closeQQWryDB - 关闭纯真 IP 数据库连接
 func (a *App) closeQQWryDB() {
 	a.qqwryMu.Lock()
 	defer a.qqwryMu.Unlock()
 	a.qqwryDB = nil
 }
 
+// lookupQQWry - 通过纯真 IP 数据库查询地理位置
+// 返回国家、地区、城市信息
 func (a *App) lookupQQWry(ip string) (country, region, city string) {
 	a.qqwryMu.RLock()
 	db := a.qqwryDB
@@ -80,6 +95,7 @@ func (a *App) lookupQQWry(ip string) (country, region, city string) {
 	}
 	location, err := db.QueryIP(strings.TrimSpace(ip))
 	if err != nil || location == nil {
+		Error("qqwry query ip failed for ip %s: %v", ip, err)
 		return "", "", ""
 	}
 	country = normalizeGeoCountry(location.Country)
@@ -94,6 +110,8 @@ func (a *App) lookupQQWry(ip string) (country, region, city string) {
 	return
 }
 
+// normalizeGeoCountry - 规范化国家名称
+// 将中文国家名转换为标准代码（如 "中国" -> "CN"）
 func normalizeGeoCountry(country string) string {
 	country = strings.TrimSpace(country)
 	switch country {
@@ -106,6 +124,8 @@ func normalizeGeoCountry(country string) string {
 	}
 }
 
+// isIgnoredGeoCountry - 判断是否为应忽略的地理位置
+// 忽略保留地址、局域网等无效地理位置
 func isIgnoredGeoCountry(country string) bool {
 	switch strings.ToUpper(strings.TrimSpace(country)) {
 	case "", "0", "IANA", "LAN":
@@ -115,9 +135,11 @@ func isIgnoredGeoCountry(country string) bool {
 	}
 }
 
+// reloadGeoIPDB - 重新加载 MaxMind GeoIP2 数据库
 func (a *App) reloadGeoIPDB() error {
 	path, err := resolveGeoIPDBPath(a.cfg.GeoIPDBPath, a.cfg.DataDir)
 	if err != nil {
+		Error("resolve geoip db path failed: %v", err)
 		return err
 	}
 	if path == "" {
@@ -126,6 +148,7 @@ func (a *App) reloadGeoIPDB() error {
 	}
 	reader, err := geoip2.Open(path)
 	if err != nil {
+		Error("geoip database unavailable at %s: %v", path, err)
 		log.Printf("geoip database unavailable at %s, disabling local geo lookup: %v", path, err)
 		a.closeGeoIPDB()
 		return nil
@@ -139,6 +162,8 @@ func (a *App) reloadGeoIPDB() error {
 	return nil
 }
 
+// resolveGeoIPDBPath - 解析 GeoIP 数据库文件路径
+// 优先使用配置的路径，否则在默认候选路径中查找
 func resolveGeoIPDBPath(configuredPath, dataDir string) (string, error) {
 	if path := strings.TrimSpace(configuredPath); path != "" {
 		return validateGeoIPDBPath(path)
@@ -149,12 +174,14 @@ func resolveGeoIPDBPath(configuredPath, dataDir string) (string, error) {
 			return path, nil
 		}
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			Error("validate geoip db candidate %s failed: %v", candidate, err)
 			return "", err
 		}
 	}
 	return "", nil
 }
 
+// defaultGeoIPDBCandidates - 获取默认的 GeoIP 数据库候选路径列表
 func defaultGeoIPDBCandidates(dataDir string) []string {
 	candidates := make([]string, 0, 4)
 	if strings.TrimSpace(dataDir) != "" {
@@ -167,6 +194,7 @@ func defaultGeoIPDBCandidates(dataDir string) []string {
 	return uniqueNonEmptyPaths(candidates)
 }
 
+// uniqueNonEmptyPaths - 去重并过滤空路径
 func uniqueNonEmptyPaths(paths []string) []string {
 	seen := make(map[string]struct{}, len(paths))
 	unique := make([]string, 0, len(paths))
@@ -185,6 +213,8 @@ func uniqueNonEmptyPaths(paths []string) []string {
 	return unique
 }
 
+// validateGeoIPDBPath - 验证 GeoIP 数据库路径是否有效
+// 检查路径是否存在且不是目录
 func validateGeoIPDBPath(path string) (string, error) {
 	path = filepath.Clean(strings.TrimSpace(path))
 	if path == "" {
@@ -200,17 +230,21 @@ func validateGeoIPDBPath(path string) (string, error) {
 	return path, nil
 }
 
+// lookupGeoIP - 通过 IP 地址查询地理位置
+// 查询顺序：纯真 IP 数据库 -> MaxMind GeoIP2 数据库
 func (a *App) lookupGeoIP(rawIP string) (country, region, city string) {
 	ip := net.ParseIP(strings.TrimSpace(rawIP))
 	if ip == nil {
 		return "", "", ""
 	}
 
+	// 优先使用纯真 IP 数据库查询
 	country, region, city = a.lookupQQWry(rawIP)
 	if country != "" {
 		return
 	}
 
+	// 回退到 MaxMind GeoIP2 数据库查询
 	a.geoIPMu.RLock()
 	reader := a.geoIPDB
 	a.geoIPMu.RUnlock()
@@ -220,6 +254,7 @@ func (a *App) lookupGeoIP(rawIP string) (country, region, city string) {
 
 	record, err := reader.City(ip)
 	if err != nil {
+		Error("geoip2 city lookup failed for ip %s: %v", rawIP, err)
 		return "", "", ""
 	}
 	if record.Country.IsoCode != "" {
@@ -237,7 +272,10 @@ func (a *App) lookupGeoIP(rawIP string) (country, region, city string) {
 	return
 }
 
+// detectGeo - 从 HTTP 请求和事件负载中检测地理位置（App 方法）
+// 检测顺序：事件负载中的地理位置 -> CDN/代理头 -> GeoIP 数据库
 func (a *App) detectGeo(r *http.Request, payload eventPayload) (country, region, city string) {
+	// 优先使用事件负载中客户端上报的地理位置
 	country = strings.TrimSpace(payload.Country)
 	region = strings.TrimSpace(payload.Region)
 	city = strings.TrimSpace(payload.City)
@@ -245,6 +283,7 @@ func (a *App) detectGeo(r *http.Request, payload eventPayload) (country, region,
 		return
 	}
 
+	// 尝试从 CDN/代理头获取地理位置
 	country = strings.TrimSpace(firstNonEmpty(
 		r.Header.Get("CF-IPCountry"),
 		r.Header.Get("X-Appengine-Country"),
@@ -263,10 +302,14 @@ func (a *App) detectGeo(r *http.Request, payload eventPayload) (country, region,
 	if country != "" || region != "" || city != "" {
 		return
 	}
+	// 回退到 GeoIP 数据库查询
 	return a.lookupGeoIP(clientIP(r))
 }
 
+// detectGeo - 从 HTTP 请求和事件负载中检测地理位置（独立函数）
+// 检测顺序：事件负载中的地理位置 -> CDN/代理头
 func detectGeo(r *http.Request, payload eventPayload) (country, region, city string) {
+	// 优先使用事件负载中客户端上报的地理位置
 	country = strings.TrimSpace(firstNonEmpty(
 		payload.Country,
 		r.Header.Get("CF-IPCountry"),
